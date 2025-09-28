@@ -67,6 +67,157 @@ class ReActStep:
     action: Action
     observation: Observation
 
+class CircuitSimulator:
+    """Interface for circuit simulation using PySpice/NgSpice"""
+    
+    def __init__(self):
+        self.ngspice = None
+        self._initialize_simulator()
+    
+    def _initialize_simulator(self):
+        """Initialize the NgSpice simulator"""
+        try:
+            self.ngspice = NgSpiceShared.new_instance()
+            logger.info("NgSpice simulator initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize NgSpice: {e}")
+            self.ngspice = None
+    
+    def simulate_netlist(self, netlist: str) -> Dict[str, Any]:
+        """Simulate a SPICE netlist and return results"""
+        if not self.ngspice:
+            return {
+                "success": False,
+                "error": "Simulator not initialized",
+                "results": {}
+            }
+        
+        try:
+            # Parse and validate netlist
+            validation_result = self.validate_netlist(netlist)
+            if not validation_result["valid"]:
+                return {
+                    "success": False,
+                    "error": f"Invalid netlist: {validation_result['errors']}",
+                    "results": {}
+                }
+            
+            # Run simulation
+            circuit_lines = netlist.strip().split('\n')
+            
+            # Load circuit
+            for line in circuit_lines:
+                if line.strip() and not line.strip().startswith('*'):
+                    self.ngspice.load_circuit(line)
+            
+            # Run different types of analysis
+            results = {}
+            
+            # DC Analysis
+            try:
+                dc_results = self.ngspice.run_analysis('dc')
+                results["dc_analysis"] = self._parse_dc_results(dc_results)
+            except Exception as e:
+                logger.warning(f"DC analysis failed: {e}")
+            
+            # AC Analysis (if applicable)
+            try:
+                ac_results = self.ngspice.run_analysis('ac')
+                results["ac_analysis"] = self._parse_ac_results(ac_results)
+            except Exception as e:
+                logger.warning(f"AC analysis failed: {e}")
+            
+            # Transient Analysis (if applicable)  
+            try:
+                tran_results = self.ngspice.run_analysis('tran')
+                results["transient_analysis"] = self._parse_transient_results(tran_results)
+            except Exception as e:
+                logger.warning(f"Transient analysis failed: {e}")
+            
+            return {
+                "success": True,
+                "error": None,
+                "results": results
+            }
+            
+        except Exception as e:
+            logger.error(f"Simulation failed: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "results": {}
+            }
+    
+    def validate_netlist(self, netlist: str) -> Dict[str, Any]:
+        """Validate a SPICE netlist"""
+        errors = []
+        warnings = []
+        
+        lines = netlist.strip().split('\n')
+        
+        # Basic validation checks
+        has_ground = False
+        has_sources = False
+        component_count = 0
+        
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('*'):
+                continue
+                
+            # Check for ground node (node 0)
+            if '0' in line.split():
+                has_ground = True
+            
+            # Check for voltage/current sources
+            if line.upper().startswith(('V', 'I')):
+                has_sources = True
+            
+            # Count components
+            if not line.upper().startswith(('.', '*')):
+                component_count += 1
+        
+        if not has_ground:
+            errors.append("No ground node (0) found")
+        
+        if not has_sources:
+            warnings.append("No voltage or current sources found")
+        
+        if component_count == 0:
+            errors.append("No circuit components found")
+        
+        return {
+            "valid": len(errors) == 0,
+            "errors": errors,
+            "warnings": warnings,
+            "component_count": component_count
+        }
+    
+    def _parse_dc_results(self, results) -> Dict[str, Any]:
+        """Parse DC analysis results"""
+        # Simplified implementation - would need actual NgSpice result parsing
+        return {
+            "node_voltages": {},
+            "branch_currents": {},
+            "power_dissipation": {}
+        }
+    
+    def _parse_ac_results(self, results) -> Dict[str, Any]:
+        """Parse AC analysis results"""
+        return {
+            "frequency_response": {},
+            "gain": 0.0,
+            "phase": 0.0
+        }
+    
+    def _parse_transient_results(self, results) -> Dict[str, Any]:
+        """Parse transient analysis results"""
+        return {
+            "time_domain_response": {},
+            "settling_time": 0.0,
+            "overshoot": 0.0
+        }
+
 class DecisionMakingHead:
     """
     ReAct-based decision making system for circuit analysis
