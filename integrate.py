@@ -15,7 +15,7 @@ from ultralytics import YOLO
 from transformers import pipeline, AutoProcessor, AutoModel
 
 # Import our custom modules
-from circuit_analyzer_rag import HybridRAGSystem, CircuitContext, create_circuit_rag_system
+from circuit_analyzer_RAG import HybridRAGSystem, CircuitContext, create_circuit_rag_system
 from decision_making_head import DecisionMakingHead, create_decision_making_head
 
 # Configure logging
