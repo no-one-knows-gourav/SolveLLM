@@ -1,12 +1,13 @@
 """
 LangGraph-Based Decision-Making Head for Circuit Analysis
 Integrates Hybrid RAG, Circuit Simulation, and ReAct Framework
+Fixed and Enhanced Version
 """
 
 import os
 import json
 import asyncio
-from typing import Annotated, TypedDict, List, Dict, Any, Optional, Literal
+from typing import Annotated, TypedDict, List, Dict, Any, Optional, Literal, Union
 from datetime import datetime
 import logging
 
@@ -14,7 +15,7 @@ import logging
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from langchain_core.tools import tool
@@ -41,7 +42,7 @@ from langchain.schema import Document
 
 # Utilities
 import operator
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 import numpy as np
 from dotenv import load_dotenv
 
@@ -49,13 +50,18 @@ from dotenv import load_dotenv
 import subprocess
 import tempfile
 import re
+from pathlib import Path
 
 # Load environment variables
 load_dotenv()
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
+
 
 # ==================== STATE DEFINITIONS ====================
 
@@ -68,7 +74,7 @@ class CircuitAnalysisState(TypedDict):
     refined_netlist: Optional[str]
     
     # Processing state
-    messages: Annotated[List[HumanMessage | AIMessage | SystemMessage], operator.add]
+    messages: Annotated[List[Union[HumanMessage, AIMessage, SystemMessage]], operator.add]
     iteration: int
     max_iterations: int
     
@@ -106,6 +112,9 @@ class SimulationResult(BaseModel):
     error_message: Optional[str] = None
     output_log: Optional[str] = None
 
+    class Config:
+        arbitrary_types_allowed = True
+
 
 # ==================== HYBRID RAG SYSTEM ====================
 
@@ -120,52 +129,67 @@ class HybridRAGRetriever:
     
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        
-        # Initialize embeddings
-        self.embeddings = self._initialize_embeddings()
-        
-        # Initialize vector stores
+        self.embeddings = None
         self.vector_store = None
         self.bm25_retriever = None
+        self.reranker = None
         
-        # Initialize reranker
-        self.reranker = self._initialize_reranker()
-        
-        # Load knowledge base
-        self._load_knowledge_base()
+        try:
+            # Initialize embeddings
+            self.embeddings = self._initialize_embeddings()
+            
+            # Initialize reranker
+            self.reranker = self._initialize_reranker()
+            
+            # Load knowledge base
+            self._load_knowledge_base()
+            
+            logger.info("HybridRAGRetriever initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize RAG retriever: {e}")
     
     def _initialize_embeddings(self):
         """Initialize embedding model"""
         embedding_type = self.config.get("embedding_type", "huggingface")
         
-        if embedding_type == "openai":
-            return OpenAIEmbeddings(
-                model=self.config.get("embedding_model", "text-embedding-3-small")
-            )
-        else:
-            return HuggingFaceEmbeddings(
-                model_name=self.config.get(
+        try:
+            if embedding_type == "openai":
+                model = self.config.get("embedding_model", "text-embedding-3-small")
+                return OpenAIEmbeddings(model=model)
+            else:
+                model_name = self.config.get(
                     "embedding_model", 
                     "sentence-transformers/all-MiniLM-L6-v2"
                 )
-            )
+                return HuggingFaceEmbeddings(
+                    model_name=model_name,
+                    model_kwargs={'device': 'cpu'},
+                    encode_kwargs={'normalize_embeddings': True}
+                )
+        except Exception as e:
+            logger.error(f"Failed to initialize embeddings: {e}")
+            raise
     
     def _initialize_reranker(self):
         """Initialize cross-encoder reranker"""
-        model = HuggingFaceCrossEncoder(
-            model_name=self.config.get(
+        try:
+            model_name = self.config.get(
                 "reranker_model",
                 "cross-encoder/ms-marco-MiniLM-L-6-v2"
             )
-        )
-        return CrossEncoderReranker(model=model, top_n=5)
+            model = HuggingFaceCrossEncoder(model_name=model_name)
+            return CrossEncoderReranker(model=model, top_n=5)
+        except Exception as e:
+            logger.warning(f"Failed to initialize reranker: {e}")
+            return None
     
     def _load_knowledge_base(self):
         """Load and index knowledge base documents"""
         kb_path = self.config.get("knowledge_base_path", "./circuit_knowledge_base")
         
         if not os.path.exists(kb_path):
-            logger.warning(f"Knowledge base path {kb_path} does not exist")
+            logger.warning(f"Knowledge base path {kb_path} does not exist. Creating directory...")
+            os.makedirs(kb_path, exist_ok=True)
             return
         
         # Load documents
@@ -186,16 +210,28 @@ class HybridRAGRetriever:
         logger.info(f"Loaded {len(documents)} documents, split into {len(chunks)} chunks")
         
         # Create vector store
-        persist_dir = self.config.get("persist_directory", "./chroma_db")
-        self.vector_store = Chroma.from_documents(
-            documents=chunks,
-            embedding=self.embeddings,
-            persist_directory=persist_dir
-        )
+        try:
+            persist_dir = self.config.get("persist_directory", "./chroma_db")
+            os.makedirs(persist_dir, exist_ok=True)
+            
+            self.vector_store = Chroma.from_documents(
+                documents=chunks,
+                embedding=self.embeddings,
+                persist_directory=persist_dir
+            )
+            logger.info(f"Vector store created with {len(chunks)} chunks")
+        except Exception as e:
+            logger.error(f"Failed to create vector store: {e}")
+            self.vector_store = None
         
         # Create BM25 retriever
-        self.bm25_retriever = BM25Retriever.from_documents(chunks)
-        self.bm25_retriever.k = self.config.get("top_k", 5)
+        try:
+            self.bm25_retriever = BM25Retriever.from_documents(chunks)
+            self.bm25_retriever.k = self.config.get("top_k", 5)
+            logger.info("BM25 retriever created successfully")
+        except Exception as e:
+            logger.error(f"Failed to create BM25 retriever: {e}")
+            self.bm25_retriever = None
     
     def _load_documents(self, kb_path: str) -> List[Document]:
         """Load documents from knowledge base directory"""
@@ -207,9 +243,12 @@ class HybridRAGRetriever:
                 kb_path,
                 glob="**/*.pdf",
                 loader_cls=PyPDFLoader,
-                show_progress=True
+                show_progress=False,
+                silent_errors=True
             )
-            documents.extend(pdf_loader.load())
+            pdf_docs = pdf_loader.load()
+            documents.extend(pdf_docs)
+            logger.info(f"Loaded {len(pdf_docs)} PDF documents")
         except Exception as e:
             logger.warning(f"Error loading PDFs: {e}")
         
@@ -219,9 +258,12 @@ class HybridRAGRetriever:
                 kb_path,
                 glob="**/*.docx",
                 loader_cls=Docx2txtLoader,
-                show_progress=True
+                show_progress=False,
+                silent_errors=True
             )
-            documents.extend(docx_loader.load())
+            docx_docs = docx_loader.load()
+            documents.extend(docx_docs)
+            logger.info(f"Loaded {len(docx_docs)} DOCX documents")
         except Exception as e:
             logger.warning(f"Error loading DOCX files: {e}")
         
@@ -231,9 +273,12 @@ class HybridRAGRetriever:
                 kb_path,
                 glob="**/*.txt",
                 loader_cls=TextLoader,
-                show_progress=True
+                show_progress=False,
+                silent_errors=True
             )
-            documents.extend(txt_loader.load())
+            txt_docs = txt_loader.load()
+            documents.extend(txt_docs)
+            logger.info(f"Loaded {len(txt_docs)} text documents")
         except Exception as e:
             logger.warning(f"Error loading text files: {e}")
         
@@ -258,32 +303,33 @@ class HybridRAGRetriever:
         """
         
         if not self.vector_store or not self.bm25_retriever:
-            logger.warning("RAG system not initialized, returning empty context")
-            return "No knowledge base available."
+            logger.warning("RAG system not fully initialized, returning limited context")
+            return "Knowledge base not available or not fully initialized."
         
         # Enhance query with circuit context
         enhanced_query = self._enhance_query(query, circuit_context)
         
-        # Dense retrieval
-        dense_retriever = self.vector_store.as_retriever(
-            search_kwargs={"k": top_k * 2}
-        )
-        
-        # Create ensemble retriever
-        ensemble_retriever = EnsembleRetriever(
-            retrievers=[dense_retriever, self.bm25_retriever],
-            weights=[0.7, 0.3]  # Favor dense retrieval
-        )
-        
-        # Add reranking
-        compression_retriever = ContextualCompressionRetriever(
-            base_compressor=self.reranker,
-            base_retriever=ensemble_retriever
-        )
-        
-        # Retrieve documents
         try:
-            docs = compression_retriever.get_relevant_documents(enhanced_query)
+            # Dense retrieval
+            dense_retriever = self.vector_store.as_retriever(
+                search_kwargs={"k": top_k * 2}
+            )
+            
+            # Create ensemble retriever
+            ensemble_retriever = EnsembleRetriever(
+                retrievers=[dense_retriever, self.bm25_retriever],
+                weights=[0.7, 0.3]  # Favor dense retrieval
+            )
+            
+            # Add reranking if available
+            if self.reranker:
+                compression_retriever = ContextualCompressionRetriever(
+                    base_compressor=self.reranker,
+                    base_retriever=ensemble_retriever
+                )
+                docs = compression_retriever.get_relevant_documents(enhanced_query)
+            else:
+                docs = ensemble_retriever.get_relevant_documents(enhanced_query)
             
             # Format context
             context = self._format_context(docs, circuit_context)
@@ -291,7 +337,7 @@ class HybridRAGRetriever:
             
         except Exception as e:
             logger.error(f"Retrieval error: {e}")
-            return "Error retrieving context from knowledge base."
+            return f"Error retrieving context from knowledge base: {str(e)}"
     
     def _enhance_query(
         self, 
@@ -341,7 +387,7 @@ class HybridRAGRetriever:
         for i, doc in enumerate(docs, 1):
             source = doc.metadata.get("source", "Unknown")
             content = doc.page_content.strip()
-            context_parts.append(f"\n[Source {i}] {source}")
+            context_parts.append(f"\n[Source {i}] {os.path.basename(source)}")
             context_parts.append(content)
             context_parts.append("-" * 50)
         
@@ -354,9 +400,9 @@ class CircuitSimulator:
     """NgSpice-based circuit simulator"""
     
     def __init__(self):
-        self._verify_ngspice()
+        self.ngspice_available = self._verify_ngspice()
     
-    def _verify_ngspice(self):
+    def _verify_ngspice(self) -> bool:
         """Verify NgSpice is installed"""
         try:
             result = subprocess.run(
@@ -367,12 +413,16 @@ class CircuitSimulator:
             )
             if result.returncode == 0:
                 logger.info("NgSpice verified successfully")
+                return True
             else:
                 logger.warning("NgSpice verification failed")
+                return False
         except FileNotFoundError:
-            logger.error("NgSpice not found. Please install: https://ngspice.sourceforge.io/")
+            logger.error("NgSpice not found. Please install from: https://ngspice.sourceforge.io/")
+            return False
         except Exception as e:
             logger.error(f"Error verifying NgSpice: {e}")
+            return False
     
     def simulate(self, netlist: str) -> SimulationResult:
         """
@@ -384,6 +434,12 @@ class CircuitSimulator:
         Returns:
             SimulationResult with parsed results
         """
+        
+        if not self.ngspice_available:
+            return SimulationResult(
+                success=False,
+                error_message="NgSpice not available. Please install NgSpice."
+            )
         
         # Validate netlist
         validation_errors = self._validate_netlist(netlist)
@@ -415,13 +471,13 @@ class CircuitSimulator:
                     dc_analysis=parsed_results.get("dc"),
                     ac_analysis=parsed_results.get("ac"),
                     transient_analysis=parsed_results.get("tran"),
-                    output_log=result.stdout
+                    output_log=result.stdout[:1000]  # Truncate long logs
                 )
             else:
                 return SimulationResult(
                     success=False,
                     error_message=result.stderr or "Simulation failed",
-                    output_log=result.stdout
+                    output_log=result.stdout[:1000] if result.stdout else None
                 )
                 
         except subprocess.TimeoutExpired:
@@ -438,12 +494,17 @@ class CircuitSimulator:
             # Clean up temporary file
             try:
                 os.unlink(netlist_path)
-            except:
+            except Exception:
                 pass
     
     def _validate_netlist(self, netlist: str) -> List[str]:
         """Validate SPICE netlist syntax"""
         errors = []
+        
+        if not netlist or not netlist.strip():
+            errors.append("Empty netlist")
+            return errors
+        
         lines = netlist.strip().split('\n')
         
         has_ground = False
@@ -460,7 +521,7 @@ class CircuitSimulator:
                 has_ground = True
             
             # Check for components
-            if line[0].upper() in 'RCLDVIQMX':
+            if line and line[0].upper() in 'RCLDVIQMXBEFGHJKSTUW':
                 has_component = True
             
             # Check for .END
@@ -480,25 +541,48 @@ class CircuitSimulator:
         """Parse NgSpice simulation output"""
         results = {}
         
-        # Parse DC analysis (simplified)
-        dc_pattern = r'v\((\w+)\)\s*=\s*([-\d.e+]+)'
-        dc_matches = re.findall(dc_pattern, output, re.IGNORECASE)
-        if dc_matches:
-            results["dc"] = {node: float(voltage) for node, voltage in dc_matches}
-        
-        # Parse AC analysis (simplified)
-        # Would need more sophisticated parsing for real AC analysis
-        
-        # Parse transient analysis (simplified)
-        # Would need more sophisticated parsing for real transient analysis
+        try:
+            # Parse DC analysis
+            dc_pattern = r'v\((\w+)\)\s*=\s*([-\d.e+]+)'
+            dc_matches = re.findall(dc_pattern, output, re.IGNORECASE)
+            if dc_matches:
+                results["dc"] = {node: float(voltage) for node, voltage in dc_matches}
+            
+            # Parse current results
+            current_pattern = r'i\((\w+)\)\s*=\s*([-\d.e+]+)'
+            current_matches = re.findall(current_pattern, output, re.IGNORECASE)
+            if current_matches:
+                if "dc" not in results:
+                    results["dc"] = {}
+                results["dc"].update({f"i_{source}": float(current) for source, current in current_matches})
+            
+        except Exception as e:
+            logger.warning(f"Error parsing simulation output: {e}")
         
         return results
 
 
-# ==================== LANGGRAPH TOOLS ====================
+# ==================== GLOBAL INSTANCES ====================
 
-# Initialize simulator globally
-simulator = CircuitSimulator()
+# These will be initialized by the engine
+_simulator_instance = None
+_rag_instance = None
+
+
+def get_simulator() -> CircuitSimulator:
+    """Get or create simulator instance"""
+    global _simulator_instance
+    if _simulator_instance is None:
+        _simulator_instance = CircuitSimulator()
+    return _simulator_instance
+
+
+def get_rag_retriever() -> Optional[HybridRAGRetriever]:
+    """Get RAG retriever instance"""
+    return _rag_instance
+
+
+# ==================== LANGGRAPH TOOLS ====================
 
 @tool
 def simulate_circuit(netlist: str) -> Dict[str, Any]:
@@ -511,6 +595,7 @@ def simulate_circuit(netlist: str) -> Dict[str, Any]:
     Returns:
         Dictionary containing simulation results
     """
+    simulator = get_simulator()
     result = simulator.simulate(netlist)
     return result.dict()
 
@@ -527,8 +612,11 @@ def retrieve_knowledge(query: str, circuit_type: str = "general") -> str:
     Returns:
         Formatted context string with relevant knowledge
     """
-    # This will be injected by the graph
-    return query  # Placeholder
+    rag = get_rag_retriever()
+    if rag:
+        circuit_context = {"circuit_type": circuit_type}
+        return rag.retrieve(query, circuit_context)
+    return "Knowledge base not available."
 
 
 @tool
@@ -549,6 +637,8 @@ def analyze_components(netlist: str) -> Dict[str, Any]:
         "inductors": [],
         "voltage_sources": [],
         "current_sources": [],
+        "diodes": [],
+        "transistors": [],
         "other": []
     }
     
@@ -557,7 +647,11 @@ def analyze_components(netlist: str) -> Dict[str, Any]:
         if not line or line.startswith('*') or line.startswith('.'):
             continue
         
+        if not line:
+            continue
+            
         component_type = line[0].upper()
+        
         if component_type == 'R':
             components["resistors"].append(line)
         elif component_type == 'C':
@@ -568,12 +662,22 @@ def analyze_components(netlist: str) -> Dict[str, Any]:
             components["voltage_sources"].append(line)
         elif component_type == 'I':
             components["current_sources"].append(line)
+        elif component_type == 'D':
+            components["diodes"].append(line)
+        elif component_type in ['Q', 'M']:
+            components["transistors"].append(line)
         else:
             components["other"].append(line)
     
+    # Calculate summary
+    summary = {k: len(v) for k, v in components.items() if v}
+    total_components = sum(summary.values())
+    
     return {
-        "summary": {k: len(v) for k, v in components.items()},
-        "details": components
+        "summary": summary,
+        "total_components": total_components,
+        "details": components,
+        "circuit_complexity": "simple" if total_components < 5 else "moderate" if total_components < 15 else "complex"
     }
 
 
@@ -599,9 +703,10 @@ You help students and engineers understand and solve circuit problems by:
 3. Retrieving relevant circuit theory knowledge
 4. Providing step-by-step explanations
 
-Always think carefully and show your reasoning.""")
+Always think carefully and show your reasoning. Be thorough and educational.""")
     
-    state["messages"] = [system_msg]
+    if "messages" not in state or not state["messages"]:
+        state["messages"] = [system_msg]
     
     return state
 
@@ -612,44 +717,57 @@ def decide_next_action(state: CircuitAnalysisState) -> CircuitAnalysisState:
     
     # Check iteration limit
     if state["iteration"] >= state["max_iterations"]:
+        logger.info("Max iterations reached, generating answer")
         state["next_action"] = "generate_answer"
         return state
     
-    # Decision logic
+    # Decision logic based on what's been done
     if not state.get("retrieved_context"):
         state["next_action"] = "retrieve_knowledge"
-    elif not state.get("simulation_attempted"):
+        logger.info("Next action: retrieve_knowledge (no context yet)")
+    elif not state.get("simulation_attempted") and state.get("netlist"):
         state["next_action"] = "simulate_circuit"
+        logger.info("Next action: simulate_circuit (netlist available, not yet simulated)")
     elif state.get("simulation_attempted") and not state.get("answer_generated"):
         state["next_action"] = "generate_answer"
+        logger.info("Next action: generate_answer (have context and simulation)")
     else:
-        state["next_action"] = "end"
+        state["next_action"] = "generate_answer"
+        logger.info("Next action: generate_answer (fallback)")
     
-    logger.info(f"Next action: {state['next_action']}")
     return state
 
 
-async def retrieve_knowledge_node(state: CircuitAnalysisState, config: Dict[str, Any]) -> CircuitAnalysisState:
+def retrieve_knowledge_node(state: CircuitAnalysisState) -> CircuitAnalysisState:
     """Retrieve relevant knowledge using Hybrid RAG"""
     logger.info("Retrieving knowledge from RAG system")
     
-    # Initialize RAG retriever
-    rag_retriever = config.get("rag_retriever")
-    if not rag_retriever:
-        logger.warning("RAG retriever not configured")
+    rag = get_rag_retriever()
+    if not rag:
+        logger.warning("RAG retriever not available")
         state["retrieved_context"] = "Knowledge base not available."
+        state["iteration"] += 1
         return state
     
     # Prepare circuit context
     circuit_context = {
         "circuit_type": state.get("circuit_type", "unknown"),
-        "components": [],  # Would extract from netlist
+        "components": [],
         "analysis_type": "general"
     }
     
+    # Extract component info if netlist is available
+    if state.get("netlist"):
+        try:
+            comp_analysis = analyze_components.invoke({"netlist": state["netlist"]})
+            if comp_analysis and "summary" in comp_analysis:
+                circuit_context["components"] = list(comp_analysis["summary"].keys())
+        except Exception as e:
+            logger.warning(f"Could not analyze components: {e}")
+    
     # Retrieve context
     try:
-        context = rag_retriever.retrieve(
+        context = rag.retrieve(
             query=state["question"],
             circuit_context=circuit_context,
             top_k=5
@@ -668,12 +786,19 @@ async def retrieve_knowledge_node(state: CircuitAnalysisState, config: Dict[str,
     except Exception as e:
         logger.error(f"Knowledge retrieval failed: {e}")
         state["retrieved_context"] = f"Error retrieving knowledge: {str(e)}"
+        state["reasoning_steps"].append({
+            "step": len(state["reasoning_steps"]) + 1,
+            "action": "retrieve_knowledge",
+            "result": "Failed to retrieve context",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        })
     
     state["iteration"] += 1
     return state
 
 
-async def simulate_circuit_node(state: CircuitAnalysisState) -> CircuitAnalysisState:
+def simulate_circuit_node(state: CircuitAnalysisState) -> CircuitAnalysisState:
     """Simulate the circuit using NgSpice"""
     logger.info("Simulating circuit")
     
@@ -684,10 +809,11 @@ async def simulate_circuit_node(state: CircuitAnalysisState) -> CircuitAnalysisS
         state["simulation_attempted"] = True
         state["simulation_valid"] = False
         state["simulation_error"] = "No netlist provided"
+        state["iteration"] += 1
         return state
     
     try:
-        # Run simulation
+        simulator = get_simulator()
         result = simulator.simulate(netlist)
         
         state["simulation_attempted"] = True
@@ -700,7 +826,11 @@ async def simulate_circuit_node(state: CircuitAnalysisState) -> CircuitAnalysisS
                 "step": len(state["reasoning_steps"]) + 1,
                 "action": "simulate_circuit",
                 "result": "Simulation completed successfully",
-                "details": result.dict(),
+                "details": {
+                    "dc_nodes": len(result.dc_analysis) if result.dc_analysis else 0,
+                    "has_ac": result.ac_analysis is not None,
+                    "has_transient": result.transient_analysis is not None
+                },
                 "timestamp": datetime.now().isoformat()
             })
         else:
@@ -719,32 +849,38 @@ async def simulate_circuit_node(state: CircuitAnalysisState) -> CircuitAnalysisS
         state["simulation_attempted"] = True
         state["simulation_valid"] = False
         state["simulation_error"] = str(e)
+        state["reasoning_steps"].append({
+            "step": len(state["reasoning_steps"]) + 1,
+            "action": "simulate_circuit",
+            "result": "Simulation exception",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        })
     
     state["iteration"] += 1
     return state
 
 
-async def generate_answer_node(state: CircuitAnalysisState, config: Dict[str, Any]) -> CircuitAnalysisState:
+def generate_answer_node(state: CircuitAnalysisState, llm: Any) -> CircuitAnalysisState:
     """Generate final answer using LLM with all gathered context"""
     logger.info("Generating final answer")
     
-    # Get LLM from config
-    llm = config.get("llm")
     if not llm:
-        logger.error("LLM not configured")
-        state["final_answer"] = "Error: LLM not available"
+        logger.error("LLM not provided")
+        state["final_answer"] = "Error: Language model not available"
         state["answer_generated"] = True
         return state
     
     # Construct comprehensive prompt
     prompt_parts = [
         f"Question: {state['question']}",
-        f"\nCircuit Description: {state['image_description']}",
+        f"\nCircuit Description: {state.get('image_description', 'No description provided')}",
     ]
     
     # Add netlist
-    if state.get("refined_netlist"):
-        prompt_parts.append(f"\nSPICE Netlist:\n{state['refined_netlist']}")
+    netlist = state.get("refined_netlist") or state.get("netlist")
+    if netlist:
+        prompt_parts.append(f"\nSPICE Netlist:\n{netlist}")
     
     # Add simulation results
     if state.get("simulation_valid") and state.get("simulation_results"):
@@ -761,21 +897,28 @@ async def generate_answer_node(state: CircuitAnalysisState, config: Dict[str, An
     prompt_parts.append("\nBased on all the information above, provide a comprehensive answer to the question.")
     prompt_parts.append("Include:")
     prompt_parts.append("1. Direct answer to the question")
-    prompt_parts.append("2. Step-by-step explanation")
+    prompt_parts.append("2. Step-by-step explanation with clear reasoning")
     prompt_parts.append("3. Relevant calculations (if applicable)")
-    prompt_parts.append("4. References to circuit theory")
+    prompt_parts.append("4. References to circuit theory concepts")
+    prompt_parts.append("5. Verification using simulation results (if available)")
     
     full_prompt = "\n".join(prompt_parts)
     
     try:
         # Generate answer
         messages = [
-            SystemMessage(content="You are an expert circuit analysis tutor. Provide clear, educational explanations."),
+            SystemMessage(content="You are an expert circuit analysis tutor. Provide clear, educational explanations with step-by-step reasoning."),
             HumanMessage(content=full_prompt)
         ]
         
-        response = await llm.ainvoke(messages)
-        state["final_answer"] = response.content
+        response = llm.invoke(messages)
+        
+        if hasattr(response, 'content'):
+            answer = response.content
+        else:
+            answer = str(response)
+        
+        state["final_answer"] = answer
         state["answer_generated"] = True
         state["confidence_score"] = 0.9 if state.get("simulation_valid") else 0.7
         
@@ -783,12 +926,19 @@ async def generate_answer_node(state: CircuitAnalysisState, config: Dict[str, An
             "step": len(state["reasoning_steps"]) + 1,
             "action": "generate_answer",
             "result": "Answer generated successfully",
+            "confidence": state["confidence_score"],
             "timestamp": datetime.now().isoformat()
         })
         
+        logger.info("Answer generated successfully")
+        
     except Exception as e:
         logger.error(f"Answer generation failed: {e}")
-        state["final_answer"] = f"Error generating answer: {str(e)}"
+        state["final_answer"] = f"Error generating answer: {str(e)}\n\nHowever, here's what I gathered:\n"
+        if state.get("simulation_results"):
+            state["final_answer"] += f"\nSimulation Results: {json.dumps(state['simulation_results'], indent=2)}"
+        if state.get("retrieved_context"):
+            state["final_answer"] += f"\n\nRelevant Context:\n{state['retrieved_context'][:500]}..."
         state["answer_generated"] = True
     
     return state
@@ -810,28 +960,31 @@ def route_decision(state: CircuitAnalysisState) -> Literal["retrieve", "simulate
 
 # ==================== BUILD LANGGRAPH WORKFLOW ====================
 
-def create_circuit_analysis_graph(config: Dict[str, Any]) -> StateGraph:
+def create_circuit_analysis_graph(llm: Any, rag_retriever: Optional[HybridRAGRetriever] = None) -> StateGraph:
     """
     Create the LangGraph workflow for circuit analysis
     
     Args:
-        config: Configuration dictionary containing:
-            - llm: Language model instance
-            - rag_retriever: HybridRAGRetriever instance
+        llm: Language model instance
+        rag_retriever: HybridRAGRetriever instance (optional)
             
     Returns:
         Compiled StateGraph
     """
     
+    # Set global RAG instance
+    global _rag_instance
+    _rag_instance = rag_retriever
+    
     # Create graph
     workflow = StateGraph(CircuitAnalysisState)
     
-    # Add nodes
+    # Add nodes with proper lambda wrapping to pass llm
     workflow.add_node("initialize", initialize_state)
     workflow.add_node("decide", decide_next_action)
-    workflow.add_node("retrieve", lambda s: retrieve_knowledge_node(s, config))
+    workflow.add_node("retrieve", retrieve_knowledge_node)
     workflow.add_node("simulate", simulate_circuit_node)
-    workflow.add_node("generate", lambda s: generate_answer_node(s, config))
+    workflow.add_node("generate", lambda state: generate_answer_node(state, llm))
     
     # Set entry point
     workflow.set_entry_point("initialize")
@@ -851,7 +1004,7 @@ def create_circuit_analysis_graph(config: Dict[str, Any]) -> StateGraph:
         }
     )
     
-    # After each action, go back to decide
+    # After each action, go back to decide (except generate which goes to END)
     workflow.add_edge("retrieve", "decide")
     workflow.add_edge("simulate", "decide")
     workflow.add_edge("generate", END)
@@ -860,6 +1013,7 @@ def create_circuit_analysis_graph(config: Dict[str, Any]) -> StateGraph:
     memory = MemorySaver()
     app = workflow.compile(checkpointer=memory)
     
+    logger.info("Circuit analysis graph compiled successfully")
     return app
 
 
@@ -870,38 +1024,45 @@ class CircuitAnalysisEngine:
     Main interface for circuit analysis with LangGraph-based Decision-Making Head
     """
     
-    def __init__(self, config_path: Optional[str] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
         """
         Initialize the circuit analysis engine
         
         Args:
-            config_path: Path to configuration JSON file
+            config: Configuration dictionary
         """
         # Load configuration
-        self.config = self._load_config(config_path)
+        self.config = config or self._default_config()
+        
+        # Validate configuration
+        self._validate_config()
         
         # Initialize LLM
         self.llm = self._initialize_llm()
         
         # Initialize RAG retriever
-        self.rag_retriever = HybridRAGRetriever(self.config.get("rag", {}))
+        self.rag_retriever = None
+        try:
+            self.rag_retriever = HybridRAGRetriever(self.config.get("rag", {}))
+        except Exception as e:
+            logger.warning(f"Failed to initialize RAG retriever: {e}")
         
         # Create LangGraph workflow
-        self.graph = create_circuit_analysis_graph({
-            "llm": self.llm,
-            "rag_retriever": self.rag_retriever
-        })
+        self.graph = create_circuit_analysis_graph(
+            llm=self.llm,
+            rag_retriever=self.rag_retriever
+        )
         
         logger.info("Circuit Analysis Engine initialized successfully")
     
-    def _load_config(self, config_path: Optional[str]) -> Dict[str, Any]:
-        """Load configuration from file or use defaults"""
-        
-        default_config = {
+    def _default_config(self) -> Dict[str, Any]:
+        """Get default configuration"""
+        return {
             "llm": {
-                "provider": "openai",  # or "anthropic", "ollama"
+                "provider": "openai",
                 "model": "gpt-4-turbo-preview",
-                "temperature": 0.3
+                "temperature": 0.3,
+                "max_tokens": 2000
             },
             "rag": {
                 "embedding_type": "huggingface",
@@ -910,5 +1071,188 @@ class CircuitAnalysisEngine:
                 "knowledge_base_path": "./circuit_knowledge_base",
                 "persist_directory": "./chroma_db",
                 "chunk_size": 512,
-            } 
+                "chunk_overlap": 50,
+                "top_k": 5
+            },
+            "simulation": {
+                "timeout": 30,
+                "max_retries": 2
+            },
+            "workflow": {
+                "max_iterations": 10
+            }
+        }
+    
+    def _validate_config(self):
+        """Validate configuration"""
+        required_keys = ["llm", "rag"]
+        for key in required_keys:
+            if key not in self.config:
+                raise ValueError(f"Missing required config key: {key}")
+        
+        # Validate LLM config
+        if "provider" not in self.config["llm"]:
+            raise ValueError("LLM provider not specified in config")
+    
+    def _initialize_llm(self):
+        """Initialize language model based on configuration"""
+        llm_config = self.config["llm"]
+        provider = llm_config["provider"].lower()
+        model = llm_config.get("model")
+        temperature = llm_config.get("temperature", 0.3)
+        max_tokens = llm_config.get("max_tokens", 2000)
+        
+        try:
+            if provider == "openai":
+                return ChatOpenAI(
+                    model=model or "gpt-4-turbo-preview",
+                    temperature=temperature,
+                    max_tokens=max_tokens
+                )
+            elif provider == "anthropic":
+                return ChatAnthropic(
+                    model=model or "claude-3-sonnet-20240229",
+                    temperature=temperature,
+                    max_tokens=max_tokens
+                )
+            elif provider == "ollama":
+                return ChatOllama(
+                    model=model or "llama2",
+                    temperature=temperature
+                )
+            else:
+                raise ValueError(f"Unsupported LLM provider: {provider}")
+        except Exception as e:
+            logger.error(f"Failed to initialize LLM: {e}")
+            raise
+    
+    def analyze(
+        self,
+        question: str,
+        netlist: str,
+        image_description: str = "",
+        circuit_type: Optional[str] = None,
+        max_iterations: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        Analyze a circuit and answer questions
+        
+        Args:
+            question: Question about the circuit
+            netlist: SPICE netlist of the circuit
+            image_description: Optional description of circuit diagram
+            circuit_type: Optional circuit type hint
+            max_iterations: Maximum workflow iterations
+            
+        Returns:
+            Dictionary with analysis results
+        """
+        logger.info(f"Starting circuit analysis for question: {question[:50]}...")
+        
+        # Prepare initial state
+        initial_state = {
+            "question": question,
+            "netlist": netlist,
+            "image_description": image_description or "No description provided",
+            "circuit_type": circuit_type,
+            "refined_netlist": None,
+            "messages": [],
+            "iteration": 0,
+            "max_iterations": max_iterations or self.config.get("workflow", {}).get("max_iterations", 10),
+            "retrieved_context": None,
+            "retrieval_queries": [],
+            "simulation_attempted": False,
+            "simulation_results": None,
+            "simulation_valid": False,
+            "simulation_error": None,
+            "complexity_level": None,
+            "component_analysis": None,
+            "next_action": None,
+            "confidence_score": 0.0,
+            "reasoning_steps": [],
+            "final_answer": None,
+            "answer_generated": False
+        }
+        
+        try:
+            # Run the graph
+            config = {"configurable": {"thread_id": f"analysis_{datetime.now().timestamp()}"}}
+            final_state = self.graph.invoke(initial_state, config)
+            
+            # Extract results
+            result = {
+                "question": question,
+                "answer": final_state.get("final_answer", "No answer generated"),
+                "confidence_score": final_state.get("confidence_score", 0.0),
+                "simulation_results": final_state.get("simulation_results"),
+                "simulation_valid": final_state.get("simulation_valid", False),
+                "reasoning_steps": final_state.get("reasoning_steps", []),
+                "iterations": final_state.get("iteration", 0),
+                "retrieved_context": final_state.get("retrieved_context"),
+                "success": final_state.get("answer_generated", False)
+            }
+            
+            logger.info(f"Analysis completed in {result['iterations']} iterations")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Analysis failed: {e}")
+            return {
+                "question": question,
+                "answer": f"Analysis failed: {str(e)}",
+                "confidence_score": 0.0,
+                "simulation_results": None,
+                "simulation_valid": False,
+                "reasoning_steps": [],
+                "iterations": 0,
+                "success": False,
+                "error": str(e)
+            }
+    
+    async def analyze_async(
+        self,
+        question: str,
+        netlist: str,
+        image_description: str = "",
+        circuit_type: Optional[str] = None,
+        max_iterations: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        Async version of analyze method
+        
+        Args:
+            question: Question about the circuit
+            netlist: SPICE netlist of the circuit
+            image_description: Optional description of circuit diagram
+            circuit_type: Optional circuit type hint
+            max_iterations: Maximum workflow iterations
+            
+        Returns:
+            Dictionary with analysis results
+        """
+        # For now, wrap sync version - could be improved with true async graph
+        return self.analyze(question, netlist, image_description, circuit_type, max_iterations)
+    
+    def get_system_status(self) -> Dict[str, Any]:
+        """Get status of all system components"""
+        simulator = get_simulator()
+        
+        return {
+            "llm": {
+                "provider": self.config["llm"]["provider"],
+                "model": self.config["llm"]["model"],
+                "available": self.llm is not None
+            },
+            "rag": {
+                "available": self.rag_retriever is not None,
+                "vector_store": self.rag_retriever.vector_store is not None if self.rag_retriever else False,
+                "bm25": self.rag_retriever.bm25_retriever is not None if self.rag_retriever else False,
+                "reranker": self.rag_retriever.reranker is not None if self.rag_retriever else False
+            },
+            "simulator": {
+                "ngspice_available": simulator.ngspice_available if simulator else False
+            },
+            "graph": {
+                "compiled": self.graph is not None
+            }
         }
