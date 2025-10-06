@@ -1,7 +1,7 @@
 """
 LangGraph-Based Decision-Making Head for Circuit Analysis
-Integrates Hybrid RAG, Circuit Simulation, and ReAct Framework
-Fixed and Enhanced Version
+Integrates Hybrid RAG, Circuit Simulation (PySpice), and ReAct Framework
+Complete Production-Ready Version
 """
 
 import os
@@ -10,6 +10,7 @@ import asyncio
 from typing import Annotated, TypedDict, List, Dict, Any, Optional, Literal, Union
 from datetime import datetime
 import logging
+from pathlib import Path
 
 # LangGraph and LangChain
 from langgraph.graph import StateGraph, END
@@ -46,11 +47,19 @@ from pydantic import BaseModel, Field, validator
 import numpy as np
 from dotenv import load_dotenv
 
-# Circuit simulation
-import subprocess
-import tempfile
+# PySpice for circuit simulation
+try:
+    from PySpice.Spice.Netlist import Circuit
+    from PySpice.Unit import *
+    from PySpice.Spice.NgSpice.Shared import NgSpiceShared
+    PYSPICE_AVAILABLE = True
+except ImportError:
+    PYSPICE_AVAILABLE = False
+    logger_temp = logging.getLogger(__name__)
+    logger_temp.warning("PySpice not available. Install with: pip install PySpice")
+
 import re
-from pathlib import Path
+import tempfile
 
 # Load environment variables
 load_dotenv()
@@ -107,10 +116,11 @@ class SimulationResult(BaseModel):
     """Structured simulation result"""
     success: bool
     dc_analysis: Optional[Dict[str, float]] = None
-    ac_analysis: Optional[Dict[str, float]] = None
+    ac_analysis: Optional[Dict[str, Any]] = None
     transient_analysis: Optional[Dict[str, Any]] = None
+    operating_point: Optional[Dict[str, float]] = None
     error_message: Optional[str] = None
-    output_log: Optional[str] = None
+    raw_output: Optional[str] = None
 
     class Config:
         arbitrary_types_allowed = True
@@ -394,39 +404,23 @@ class HybridRAGRetriever:
         return "\n".join(context_parts)
 
 
-# ==================== CIRCUIT SIMULATION TOOLS ====================
+# ==================== CIRCUIT SIMULATION WITH PYSPICE ====================
 
-class CircuitSimulator:
-    """NgSpice-based circuit simulator"""
+class PySpiceSimulator:
+    """
+    Circuit simulator using PySpice library
+    """
     
     def __init__(self):
-        self.ngspice_available = self._verify_ngspice()
-    
-    def _verify_ngspice(self) -> bool:
-        """Verify NgSpice is installed"""
-        try:
-            result = subprocess.run(
-                ["ngspice", "--version"],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            if result.returncode == 0:
-                logger.info("NgSpice verified successfully")
-                return True
-            else:
-                logger.warning("NgSpice verification failed")
-                return False
-        except FileNotFoundError:
-            logger.error("NgSpice not found. Please install from: https://ngspice.sourceforge.io/")
-            return False
-        except Exception as e:
-            logger.error(f"Error verifying NgSpice: {e}")
-            return False
+        self.pyspice_available = PYSPICE_AVAILABLE
+        if not self.pyspice_available:
+            logger.warning("PySpice not available. Install with: pip install PySpice")
+        else:
+            logger.info("PySpice simulator initialized")
     
     def simulate(self, netlist: str) -> SimulationResult:
         """
-        Simulate a SPICE netlist
+        Simulate a SPICE netlist using PySpice
         
         Args:
             netlist: SPICE netlist string
@@ -435,10 +429,10 @@ class CircuitSimulator:
             SimulationResult with parsed results
         """
         
-        if not self.ngspice_available:
+        if not self.pyspice_available:
             return SimulationResult(
                 success=False,
-                error_message="NgSpice not available. Please install NgSpice."
+                error_message="PySpice not available. Please install PySpice: pip install PySpice"
             )
         
         # Validate netlist
@@ -449,53 +443,36 @@ class CircuitSimulator:
                 error_message=f"Netlist validation failed: {'; '.join(validation_errors)}"
             )
         
-        # Create temporary file for netlist
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.cir', delete=False) as f:
-            f.write(netlist)
-            netlist_path = f.name
-        
         try:
-            # Run NgSpice simulation
-            result = subprocess.run(
-                ["ngspice", "-b", netlist_path],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
+            # Parse the netlist and create circuit
+            circuit_info = self._parse_netlist(netlist)
             
-            # Parse output
-            if result.returncode == 0:
-                parsed_results = self._parse_simulation_output(result.stdout)
-                return SimulationResult(
-                    success=True,
-                    dc_analysis=parsed_results.get("dc"),
-                    ac_analysis=parsed_results.get("ac"),
-                    transient_analysis=parsed_results.get("tran"),
-                    output_log=result.stdout[:1000]  # Truncate long logs
-                )
-            else:
+            if circuit_info.get("error"):
                 return SimulationResult(
                     success=False,
-                    error_message=result.stderr or "Simulation failed",
-                    output_log=result.stdout[:1000] if result.stdout else None
+                    error_message=circuit_info["error"]
                 )
-                
-        except subprocess.TimeoutExpired:
-            return SimulationResult(
-                success=False,
-                error_message="Simulation timeout (>30s)"
-            )
+            
+            # Create PySpice circuit
+            circuit = self._create_pyspice_circuit(circuit_info)
+            
+            if circuit is None:
+                return SimulationResult(
+                    success=False,
+                    error_message="Failed to create PySpice circuit"
+                )
+            
+            # Run simulation based on analysis type
+            results = self._run_simulation(circuit, circuit_info)
+            
+            return results
+            
         except Exception as e:
+            logger.error(f"Simulation error: {e}")
             return SimulationResult(
                 success=False,
-                error_message=f"Simulation error: {str(e)}"
+                error_message=f"Simulation exception: {str(e)}"
             )
-        finally:
-            # Clean up temporary file
-            try:
-                os.unlink(netlist_path)
-            except Exception:
-                pass
     
     def _validate_netlist(self, netlist: str) -> List[str]:
         """Validate SPICE netlist syntax"""
@@ -509,57 +486,359 @@ class CircuitSimulator:
         
         has_ground = False
         has_component = False
-        has_end = False
+        has_analysis = False
         
         for line in lines:
             line = line.strip()
             if not line or line.startswith('*'):
                 continue
             
-            # Check for ground node
-            if '0' in line.split():
+            # Check for ground node (0 or GND)
+            if '0' in line.split() or 'GND' in line.upper():
                 has_ground = True
             
             # Check for components
             if line and line[0].upper() in 'RCLDVIQMXBEFGHJKSTUW':
                 has_component = True
             
-            # Check for .END
-            if line.upper() == '.END':
-                has_end = True
+            # Check for analysis commands
+            if line.startswith('.') and line.split()[0].upper() in ['.OP', '.DC', '.AC', '.TRAN']:
+                has_analysis = True
         
         if not has_ground:
-            errors.append("No ground node (0) found")
+            errors.append("No ground node (0 or GND) found")
         if not has_component:
             errors.append("No circuit components found")
-        if not has_end:
-            errors.append("Missing .END statement")
+        if not has_analysis:
+            logger.warning("No analysis command found, will default to .OP")
         
         return errors
     
-    def _parse_simulation_output(self, output: str) -> Dict[str, Any]:
-        """Parse NgSpice simulation output"""
-        results = {}
+    def _parse_netlist(self, netlist: str) -> Dict[str, Any]:
+        """Parse SPICE netlist into structured format"""
+        lines = netlist.strip().split('\n')
+        
+        circuit_info = {
+            "title": "Circuit",
+            "components": [],
+            "analysis": [],
+            "options": []
+        }
+        
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('*'):
+                continue
+            
+            if line.upper() == '.END':
+                continue
+            
+            # Parse title (first non-comment line)
+            if not circuit_info.get("title_set"):
+                if not line.startswith('.') and line[0].upper() not in 'RCLDVIQMXBEFGHJKSTUW':
+                    circuit_info["title"] = line
+                    circuit_info["title_set"] = True
+                    continue
+            
+            # Parse components
+            if line and line[0].upper() in 'RCLDVIQMXBEFGHJKSTUW':
+                circuit_info["components"].append(self._parse_component(line))
+            
+            # Parse analysis commands
+            elif line.startswith('.'):
+                cmd = line.split()[0].upper()
+                if cmd in ['.OP', '.DC', '.AC', '.TRAN']:
+                    circuit_info["analysis"].append({
+                        "type": cmd[1:],
+                        "command": line
+                    })
+                elif cmd in ['.OPTIONS', '.OPTION']:
+                    circuit_info["options"].append(line)
+        
+        # Default to operating point if no analysis specified
+        if not circuit_info["analysis"]:
+            circuit_info["analysis"].append({
+                "type": "OP",
+                "command": ".OP"
+            })
+        
+        return circuit_info
+    
+    def _parse_component(self, line: str) -> Dict[str, Any]:
+        """Parse a component line"""
+        parts = line.split()
+        comp_type = line[0].upper()
+        
+        component = {
+            "type": comp_type,
+            "name": parts[0],
+            "raw": line
+        }
         
         try:
-            # Parse DC analysis
-            dc_pattern = r'v\((\w+)\)\s*=\s*([-\d.e+]+)'
-            dc_matches = re.findall(dc_pattern, output, re.IGNORECASE)
-            if dc_matches:
-                results["dc"] = {node: float(voltage) for node, voltage in dc_matches}
+            if comp_type == 'R':  # Resistor
+                component["nodes"] = [parts[1], parts[2]]
+                component["value"] = parts[3]
+            elif comp_type == 'C':  # Capacitor
+                component["nodes"] = [parts[1], parts[2]]
+                component["value"] = parts[3]
+            elif comp_type == 'L':  # Inductor
+                component["nodes"] = [parts[1], parts[2]]
+                component["value"] = parts[3]
+            elif comp_type == 'V':  # Voltage source
+                component["nodes"] = [parts[1], parts[2]]
+                component["value"] = ' '.join(parts[3:])
+            elif comp_type == 'I':  # Current source
+                component["nodes"] = [parts[1], parts[2]]
+                component["value"] = ' '.join(parts[3:])
+        except IndexError:
+            component["error"] = "Malformed component line"
+        
+        return component
+    
+    def _create_pyspice_circuit(self, circuit_info: Dict[str, Any]) -> Optional[Circuit]:
+        """Create PySpice Circuit object from parsed netlist"""
+        try:
+            circuit = Circuit(circuit_info["title"])
             
-            # Parse current results
-            current_pattern = r'i\((\w+)\)\s*=\s*([-\d.e+]+)'
-            current_matches = re.findall(current_pattern, output, re.IGNORECASE)
-            if current_matches:
-                if "dc" not in results:
-                    results["dc"] = {}
-                results["dc"].update({f"i_{source}": float(current) for source, current in current_matches})
+            for comp in circuit_info["components"]:
+                comp_type = comp["type"]
+                name = comp["name"][1:]  # Remove type prefix
+                nodes = comp.get("nodes", [])
+                value_str = comp.get("value", "")
+                
+                # Replace GND with 0
+                nodes = [n if n.upper() != 'GND' else '0' for n in nodes]
+                
+                try:
+                    if comp_type == 'R':
+                        # Parse resistance value
+                        value = self._parse_value(value_str)
+                        circuit.R(name, nodes[0], nodes[1], value)
+                    
+                    elif comp_type == 'C':
+                        value = self._parse_value(value_str)
+                        circuit.C(name, nodes[0], nodes[1], value)
+                    
+                    elif comp_type == 'L':
+                        value = self._parse_value(value_str)
+                        circuit.L(name, nodes[0], nodes[1], value)
+                    
+                    elif comp_type == 'V':
+                        # Parse voltage source
+                        if 'DC' in value_str.upper():
+                            dc_value = self._extract_dc_value(value_str)
+                            circuit.V(name, nodes[0], nodes[1], dc_value)
+                        else:
+                            # Try to parse as direct value
+                            try:
+                                dc_value = self._parse_value(value_str.split()[0])
+                                circuit.V(name, nodes[0], nodes[1], dc_value)
+                            except:
+                                circuit.V(name, nodes[0], nodes[1], 0)
+                    
+                    elif comp_type == 'I':
+                        if 'DC' in value_str.upper():
+                            dc_value = self._extract_dc_value(value_str)
+                            circuit.I(name, nodes[0], nodes[1], dc_value)
+                        else:
+                            try:
+                                dc_value = self._parse_value(value_str.split()[0])
+                                circuit.I(name, nodes[0], nodes[1], dc_value)
+                            except:
+                                circuit.I(name, nodes[0], nodes[1], 0)
+                
+                except Exception as e:
+                    logger.warning(f"Error adding component {comp['name']}: {e}")
+                    continue
+            
+            return circuit
             
         except Exception as e:
-            logger.warning(f"Error parsing simulation output: {e}")
+            logger.error(f"Error creating circuit: {e}")
+            return None
+    
+    def _parse_value(self, value_str: str) -> float:
+        """Parse component value with SI prefixes"""
+        value_str = value_str.strip().upper()
         
-        return results
+        # SI prefix multipliers
+        multipliers = {
+            'T': 1e12, 'G': 1e9, 'MEG': 1e6, 'X': 1e6,
+            'K': 1e3, 'M': 1e-3, 'U': 1e-6, 'N': 1e-9,
+            'P': 1e-12, 'F': 1e-15
+        }
+        
+        # Extract number and suffix
+        match = re.match(r'([-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?)\s*([A-Z]*)', value_str)
+        if match:
+            number = float(match.group(1))
+            suffix = match.group(3)
+            
+            # Check for SI prefix
+            for prefix, mult in multipliers.items():
+                if suffix.startswith(prefix):
+                    return number * mult
+            
+            return number
+        
+        # Fallback
+        try:
+            return float(value_str)
+        except:
+            return 1.0  # Default value
+    
+    def _extract_dc_value(self, value_str: str) -> float:
+        """Extract DC value from voltage/current source specification"""
+        parts = value_str.upper().split()
+        for i, part in enumerate(parts):
+            if part == 'DC' and i + 1 < len(parts):
+                return self._parse_value(parts[i + 1])
+        return 0.0
+    
+    def _run_simulation(self, circuit: Circuit, circuit_info: Dict[str, Any]) -> SimulationResult:
+        """Run simulation on PySpice circuit"""
+        try:
+            from PySpice.Spice.Netlist import Circuit as SpiceCircuit
+            
+            # Create simulator
+            simulator = circuit.simulator(temperature=25, nominal_temperature=25)
+            
+            results = SimulationResult(success=True)
+            
+            # Run each analysis
+            for analysis in circuit_info["analysis"]:
+                analysis_type = analysis["type"]
+                
+                try:
+                    if analysis_type == "OP":
+                        # Operating point analysis
+                        analysis_result = simulator.operating_point()
+                        
+                        # Extract node voltages
+                        op_results = {}
+                        for node in analysis_result.nodes.values():
+                            node_name = str(node)
+                            if node_name != '0':  # Skip ground
+                                try:
+                                    op_results[node_name] = float(node)
+                                except:
+                                    pass
+                        
+                        results.operating_point = op_results
+                        results.dc_analysis = op_results
+                        logger.info(f"Operating point analysis completed: {len(op_results)} nodes")
+                    
+                    elif analysis_type == "DC":
+                        # DC sweep analysis
+                        # Parse DC command
+                        cmd_parts = analysis["command"].split()
+                        if len(cmd_parts) >= 5:
+                            source = cmd_parts[1]
+                            start = self._parse_value(cmd_parts[2])
+                            stop = self._parse_value(cmd_parts[3])
+                            step = self._parse_value(cmd_parts[4])
+                            
+                            analysis_result = simulator.dc(
+                                **{source: slice(start, stop, step)}
+                            )
+                            
+                            # Extract results
+                            dc_results = {
+                                "sweep_variable": source,
+                                "data": {}
+                            }
+                            
+                            for node in analysis_result.nodes.values():
+                                node_name = str(node)
+                                if node_name != '0':
+                                    dc_results["data"][node_name] = list(node)
+                            
+                            results.dc_analysis = dc_results
+                            logger.info("DC sweep analysis completed")
+                    
+                    elif analysis_type == "AC":
+                        # AC analysis
+                        cmd_parts = analysis["command"].split()
+                        if len(cmd_parts) >= 4:
+                            variation = cmd_parts[1]  # DEC, OCT, LIN
+                            points = int(cmd_parts[2])
+                            fstart = self._parse_value(cmd_parts[3])
+                            fstop = self._parse_value(cmd_parts[4])
+                            
+                            analysis_result = simulator.ac(
+                                start_frequency=fstart,
+                                stop_frequency=fstop,
+                                number_of_points=points,
+                                variation=variation.lower()
+                            )
+                            
+                            # Extract results
+                            ac_results = {
+                                "frequency": list(analysis_result.frequency),
+                                "data": {}
+                            }
+                            
+                            for node in analysis_result.nodes.values():
+                                node_name = str(node)
+                                if node_name != '0':
+                                    ac_results["data"][node_name] = {
+                                        "magnitude": list(abs(node)),
+                                        "phase": list(np.angle(node, deg=True))
+                                    }
+                            
+                            results.ac_analysis = ac_results
+                            logger.info("AC analysis completed")
+                    
+                    elif analysis_type == "TRAN":
+                        # Transient analysis
+                        cmd_parts = analysis["command"].split()
+                        if len(cmd_parts) >= 3:
+                            tstep = self._parse_value(cmd_parts[1])
+                            tstop = self._parse_value(cmd_parts[2])
+                            tstart = 0
+                            if len(cmd_parts) >= 4:
+                                tstart = self._parse_value(cmd_parts[3])
+                            
+                            analysis_result = simulator.transient(
+                                step_time=tstep,
+                                end_time=tstop,
+                                start_time=tstart
+                            )
+                            
+                            # Extract results
+                            tran_results = {
+                                "time": list(analysis_result.time),
+                                "data": {}
+                            }
+                            
+                            for node in analysis_result.nodes.values():
+                                node_name = str(node)
+                                if node_name != '0':
+                                    tran_results["data"][node_name] = list(node)
+                            
+                            results.transient_analysis = tran_results
+                            logger.info("Transient analysis completed")
+                
+                except Exception as e:
+                    logger.error(f"Error in {analysis_type} analysis: {e}")
+                    if not results.error_message:
+                        results.error_message = f"{analysis_type} analysis failed: {str(e)}"
+            
+            # Check if we got any results
+            if not (results.operating_point or results.dc_analysis or 
+                   results.ac_analysis or results.transient_analysis):
+                results.success = False
+                results.error_message = "No analysis results obtained"
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Simulation execution error: {e}")
+            return SimulationResult(
+                success=False,
+                error_message=f"Simulation execution error: {str(e)}"
+            )
 
 
 # ==================== GLOBAL INSTANCES ====================
@@ -569,11 +848,11 @@ _simulator_instance = None
 _rag_instance = None
 
 
-def get_simulator() -> CircuitSimulator:
+def get_simulator() -> PySpiceSimulator:
     """Get or create simulator instance"""
     global _simulator_instance
     if _simulator_instance is None:
-        _simulator_instance = CircuitSimulator()
+        _simulator_instance = PySpiceSimulator()
     return _simulator_instance
 
 
@@ -587,7 +866,7 @@ def get_rag_retriever() -> Optional[HybridRAGRetriever]:
 @tool
 def simulate_circuit(netlist: str) -> Dict[str, Any]:
     """
-    Simulate a SPICE circuit netlist using NgSpice.
+    Simulate a SPICE circuit netlist using PySpice.
     
     Args:
         netlist: SPICE netlist string
@@ -799,8 +1078,8 @@ def retrieve_knowledge_node(state: CircuitAnalysisState) -> CircuitAnalysisState
 
 
 def simulate_circuit_node(state: CircuitAnalysisState) -> CircuitAnalysisState:
-    """Simulate the circuit using NgSpice"""
-    logger.info("Simulating circuit")
+    """Simulate the circuit using PySpice"""
+    logger.info("Simulating circuit with PySpice")
     
     netlist = state.get("refined_netlist") or state.get("netlist")
     
@@ -822,15 +1101,21 @@ def simulate_circuit_node(state: CircuitAnalysisState) -> CircuitAnalysisState:
         
         if result.success:
             logger.info("Simulation successful")
+            result_summary = {
+                "has_operating_point": result.operating_point is not None,
+                "has_dc": result.dc_analysis is not None,
+                "has_ac": result.ac_analysis is not None,
+                "has_transient": result.transient_analysis is not None
+            }
+            
+            if result.operating_point:
+                result_summary["num_nodes"] = len(result.operating_point)
+            
             state["reasoning_steps"].append({
                 "step": len(state["reasoning_steps"]) + 1,
                 "action": "simulate_circuit",
                 "result": "Simulation completed successfully",
-                "details": {
-                    "dc_nodes": len(result.dc_analysis) if result.dc_analysis else 0,
-                    "has_ac": result.ac_analysis is not None,
-                    "has_transient": result.transient_analysis is not None
-                },
+                "details": result_summary,
                 "timestamp": datetime.now().isoformat()
             })
         else:
@@ -885,29 +1170,54 @@ def generate_answer_node(state: CircuitAnalysisState, llm: Any) -> CircuitAnalys
     # Add simulation results
     if state.get("simulation_valid") and state.get("simulation_results"):
         sim_results = state["simulation_results"]
-        prompt_parts.append(f"\nSimulation Results:")
-        prompt_parts.append(json.dumps(sim_results, indent=2))
+        prompt_parts.append(f"\nSimulation Results (PySpice):")
+        
+        # Format simulation results nicely
+        if sim_results.get("operating_point"):
+            prompt_parts.append("\nOperating Point Analysis:")
+            for node, voltage in sim_results["operating_point"].items():
+                prompt_parts.append(f"  Node {node}: {voltage:.6f} V")
+        
+        if sim_results.get("dc_analysis") and isinstance(sim_results["dc_analysis"], dict):
+            if "sweep_variable" in sim_results["dc_analysis"]:
+                prompt_parts.append(f"\nDC Sweep Analysis (Variable: {sim_results['dc_analysis']['sweep_variable']}):")
+                prompt_parts.append("  [Data available for plotting]")
+            else:
+                prompt_parts.append("\nDC Analysis:")
+                for node, voltage in sim_results["dc_analysis"].items():
+                    if isinstance(voltage, (int, float)):
+                        prompt_parts.append(f"  Node {node}: {voltage:.6f} V")
+        
+        if sim_results.get("ac_analysis"):
+            prompt_parts.append(f"\nAC Analysis: Available")
+        
+        if sim_results.get("transient_analysis"):
+            prompt_parts.append(f"\nTransient Analysis: Available")
+    
     elif state.get("simulation_error"):
         prompt_parts.append(f"\nSimulation Error: {state['simulation_error']}")
+        prompt_parts.append("Note: Provide theoretical analysis since simulation failed.")
     
     # Add retrieved context
     if state.get("retrieved_context"):
         prompt_parts.append(f"\n{state['retrieved_context']}")
     
-    prompt_parts.append("\nBased on all the information above, provide a comprehensive answer to the question.")
-    prompt_parts.append("Include:")
+    prompt_parts.append("\n" + "="*60)
+    prompt_parts.append("Based on all the information above, provide a comprehensive answer.")
+    prompt_parts.append("\nYour answer should include:")
     prompt_parts.append("1. Direct answer to the question")
     prompt_parts.append("2. Step-by-step explanation with clear reasoning")
-    prompt_parts.append("3. Relevant calculations (if applicable)")
-    prompt_parts.append("4. References to circuit theory concepts")
+    prompt_parts.append("3. Relevant calculations showing your work")
+    prompt_parts.append("4. Circuit theory concepts and principles")
     prompt_parts.append("5. Verification using simulation results (if available)")
+    prompt_parts.append("6. Educational insights for learning")
     
     full_prompt = "\n".join(prompt_parts)
     
     try:
         # Generate answer
         messages = [
-            SystemMessage(content="You are an expert circuit analysis tutor. Provide clear, educational explanations with step-by-step reasoning."),
+            SystemMessage(content="You are an expert circuit analysis tutor. Provide clear, educational explanations with detailed step-by-step reasoning. Always show your calculations and explain the underlying theory."),
             HumanMessage(content=full_prompt)
         ]
         
@@ -920,7 +1230,15 @@ def generate_answer_node(state: CircuitAnalysisState, llm: Any) -> CircuitAnalys
         
         state["final_answer"] = answer
         state["answer_generated"] = True
-        state["confidence_score"] = 0.9 if state.get("simulation_valid") else 0.7
+        
+        # Calculate confidence based on available information
+        confidence = 0.5  # Base confidence
+        if state.get("simulation_valid"):
+            confidence += 0.3
+        if state.get("retrieved_context") and len(state.get("retrieved_context", "")) > 100:
+            confidence += 0.2
+        
+        state["confidence_score"] = min(confidence, 1.0)
         
         state["reasoning_steps"].append({
             "step": len(state["reasoning_steps"]) + 1,
@@ -930,16 +1248,26 @@ def generate_answer_node(state: CircuitAnalysisState, llm: Any) -> CircuitAnalys
             "timestamp": datetime.now().isoformat()
         })
         
-        logger.info("Answer generated successfully")
+        logger.info(f"Answer generated successfully (confidence: {state['confidence_score']:.2f})")
         
     except Exception as e:
         logger.error(f"Answer generation failed: {e}")
-        state["final_answer"] = f"Error generating answer: {str(e)}\n\nHowever, here's what I gathered:\n"
+        
+        # Create fallback answer with available information
+        fallback_parts = [f"I encountered an error generating the full answer: {str(e)}"]
+        fallback_parts.append("\nHowever, here's what I gathered from the analysis:")
+        
         if state.get("simulation_results"):
-            state["final_answer"] += f"\nSimulation Results: {json.dumps(state['simulation_results'], indent=2)}"
+            fallback_parts.append(f"\nSimulation Results:")
+            fallback_parts.append(json.dumps(state["simulation_results"], indent=2))
+        
         if state.get("retrieved_context"):
-            state["final_answer"] += f"\n\nRelevant Context:\n{state['retrieved_context'][:500]}..."
+            context_preview = state["retrieved_context"][:500]
+            fallback_parts.append(f"\nRelevant Context (preview):\n{context_preview}...")
+        
+        state["final_answer"] = "\n".join(fallback_parts)
         state["answer_generated"] = True
+        state["confidence_score"] = 0.3
     
     return state
 
@@ -1022,6 +1350,7 @@ def create_circuit_analysis_graph(llm: Any, rag_retriever: Optional[HybridRAGRet
 class CircuitAnalysisEngine:
     """
     Main interface for circuit analysis with LangGraph-based Decision-Making Head
+    Uses PySpice for accurate circuit simulation
     """
     
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -1250,7 +1579,8 @@ class CircuitAnalysisEngine:
                 "reranker": self.rag_retriever.reranker is not None if self.rag_retriever else False
             },
             "simulator": {
-                "ngspice_available": simulator.ngspice_available if simulator else False
+                "type": "PySpice",
+                "pyspice_available": simulator.pyspice_available if simulator else False
             },
             "graph": {
                 "compiled": self.graph is not None
