@@ -1,32 +1,32 @@
 """
-LangGraph-Based Decision-Making Head for Circuit Analysis
-Integrates Hybrid RAG, Circuit Simulation (PySpice), and ReAct Framework
-Complete Production-Ready Version
+LangGraph-Based Circuit Analysis Engine with Incremental RAG Updates
+Production-ready implementation with PySpice simulation and Hybrid RAG
 """
 
 import os
 import json
 import asyncio
+import hashlib
+import re
+import pickle
+import tempfile
 from typing import Annotated, TypedDict, List, Dict, Any, Optional, Literal, Union
 from datetime import datetime
 import logging
 from pathlib import Path
+import operator
 
 # LangGraph and LangChain
 from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import tool
-from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 from langchain_community.chat_models import ChatOllama
 
 # Vector stores and embeddings
-from langchain_community.vectorstores import Chroma, FAISS
+from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.retrievers import BM25Retriever
@@ -36,35 +36,23 @@ from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 
 # Document processing
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import (
-    PyPDFLoader, Docx2txtLoader, TextLoader, DirectoryLoader
-)
+from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader, DirectoryLoader
 from langchain.schema import Document
 
 # Utilities
-import operator
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel
 import numpy as np
 from dotenv import load_dotenv
 
-# PySpice for circuit simulation
+# PySpice
 try:
     from PySpice.Spice.Netlist import Circuit
-    from PySpice.Unit import *
-    from PySpice.Spice.NgSpice.Shared import NgSpiceShared
     PYSPICE_AVAILABLE = True
 except ImportError:
     PYSPICE_AVAILABLE = False
-    logger_temp = logging.getLogger(__name__)
-    logger_temp.warning("PySpice not available. Install with: pip install PySpice")
 
-import re
-import tempfile
-
-# Load environment variables
 load_dotenv()
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -72,45 +60,32 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ==================== STATE DEFINITIONS ====================
+# ==================== STATE & MODELS ====================
 
 class CircuitAnalysisState(TypedDict):
-    """State for the circuit analysis workflow"""
-    # Input
+    """State for circuit analysis workflow"""
     question: str
     image_description: str
     netlist: str
     refined_netlist: Optional[str]
-    
-    # Processing state
     messages: Annotated[List[Union[HumanMessage, AIMessage, SystemMessage]], operator.add]
     iteration: int
     max_iterations: int
-    
-    # Retrieval
     retrieved_context: Optional[str]
     retrieval_queries: List[str]
-    
-    # Simulation
     simulation_attempted: bool
     simulation_results: Optional[Dict[str, Any]]
     simulation_valid: bool
     simulation_error: Optional[str]
-    
-    # Analysis
     circuit_type: Optional[str]
     complexity_level: Optional[str]
     component_analysis: Optional[Dict[str, Any]]
-    
-    # Decision making
     next_action: Optional[str]
     confidence_score: float
     reasoning_steps: List[Dict[str, Any]]
-    
-    # Output
     final_answer: Optional[str]
     answer_generated: bool
-    
+
 
 class SimulationResult(BaseModel):
     """Structured simulation result"""
@@ -126,16 +101,130 @@ class SimulationResult(BaseModel):
         arbitrary_types_allowed = True
 
 
-# ==================== HYBRID RAG SYSTEM ====================
+# ==================== KNOWLEDGE BASE INDEXER ====================
+
+class KnowledgeBaseIndexer:
+    """Manages incremental knowledge base indexing"""
+    
+    def __init__(self, kb_path: str, persist_dir: str, metadata_file: str = "kb_metadata.pkl"):
+        self.kb_path = Path(kb_path)
+        self.persist_dir = Path(persist_dir)
+        self.metadata_file = self.persist_dir / metadata_file
+        self.file_metadata = {}
+        
+        self.kb_path.mkdir(parents=True, exist_ok=True)
+        self.persist_dir.mkdir(parents=True, exist_ok=True)
+        self._load_metadata()
+    
+    def _load_metadata(self):
+        """Load existing file metadata"""
+        if self.metadata_file.exists():
+            try:
+                with open(self.metadata_file, 'rb') as f:
+                    self.file_metadata = pickle.load(f)
+                logger.info(f"Loaded metadata for {len(self.file_metadata)} files")
+            except Exception as e:
+                logger.warning(f"Failed to load metadata: {e}")
+                self.file_metadata = {}
+        else:
+            logger.info("No existing metadata found")
+            self.file_metadata = {}
+    
+    def _save_metadata(self):
+        """Save file metadata"""
+        try:
+            with open(self.metadata_file, 'wb') as f:
+                pickle.dump(self.file_metadata, f)
+            logger.info(f"Saved metadata for {len(self.file_metadata)} files")
+        except Exception as e:
+            logger.error(f"Failed to save metadata: {e}")
+    
+    def _get_file_hash(self, filepath: Path) -> str:
+        """Calculate MD5 hash of file"""
+        try:
+            hasher = hashlib.md5()
+            with open(filepath, 'rb') as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hasher.update(chunk)
+            return hasher.hexdigest()
+        except Exception as e:
+            logger.error(f"Error hashing {filepath}: {e}")
+            return ""
+    
+    def _get_file_info(self, filepath: Path) -> Optional[Dict[str, Any]]:
+        """Get file information"""
+        try:
+            stat = filepath.stat()
+            return {
+                "path": str(filepath),
+                "hash": self._get_file_hash(filepath),
+                "mtime": stat.st_mtime,
+                "size": stat.st_size
+            }
+        except Exception as e:
+            logger.error(f"Error getting file info for {filepath}: {e}")
+            return None
+    
+    def scan_changes(self) -> Dict[str, List[Path]]:
+        """Scan for file changes"""
+        changes = {"added": [], "modified": [], "deleted": []}
+        
+        # Get current files
+        current_files = {}
+        for pattern in ["**/*.pdf", "**/*.docx", "**/*.txt"]:
+            for filepath in self.kb_path.glob(pattern):
+                if filepath.is_file():
+                    current_files[str(filepath)] = filepath
+        
+        # Check for new/modified files
+        for filepath_str, filepath in current_files.items():
+            file_info = self._get_file_info(filepath)
+            if not file_info:
+                continue
+            
+            if filepath_str not in self.file_metadata:
+                changes["added"].append(filepath)
+                logger.info(f"New file: {filepath.name}")
+            else:
+                old_hash = self.file_metadata[filepath_str].get("hash")
+                if old_hash != file_info["hash"]:
+                    changes["modified"].append(filepath)
+                    logger.info(f"Modified file: {filepath.name}")
+        
+        # Check for deleted files
+        for filepath_str in list(self.file_metadata.keys()):
+            if filepath_str not in current_files:
+                changes["deleted"].append(Path(filepath_str))
+                logger.info(f"Deleted file: {Path(filepath_str).name}")
+        
+        return changes
+    
+    def update_metadata(self, files: List[Path]):
+        """Update metadata for files"""
+        for filepath in files:
+            file_info = self._get_file_info(filepath)
+            if file_info:
+                self.file_metadata[str(filepath)] = file_info
+    
+    def remove_from_metadata(self, files: List[Path]):
+        """Remove files from metadata"""
+        for filepath in files:
+            self.file_metadata.pop(str(filepath), None)
+    
+    def needs_reindex(self) -> bool:
+        """Check if reindexing needed"""
+        changes = self.scan_changes()
+        return bool(changes["added"] or changes["modified"] or changes["deleted"])
+    
+    def save(self):
+        """Save metadata"""
+        self._save_metadata()
+
+
+# ==================== HYBRID RAG RETRIEVER ====================
 
 class HybridRAGRetriever:
-    """
-    Production-grade Hybrid RAG system combining:
-    - Dense retrieval (vector similarity)
-    - Sparse retrieval (BM25)
-    - Cross-encoder reranking
-    - Circuit-specific context
-    """
+    """Hybrid RAG with incremental updates"""
     
     def __init__(self, config: Dict[str, Any]):
         self.config = config
@@ -143,73 +232,231 @@ class HybridRAGRetriever:
         self.vector_store = None
         self.bm25_retriever = None
         self.reranker = None
+        self.indexer = None
+        self.all_chunks = []
         
         try:
-            # Initialize embeddings
             self.embeddings = self._initialize_embeddings()
-            
-            # Initialize reranker
             self.reranker = self._initialize_reranker()
             
-            # Load knowledge base
-            self._load_knowledge_base()
+            kb_path = config.get("knowledge_base_path", "./circuit_knowledge_base")
+            persist_dir = config.get("persist_directory", "./chroma_db")
+            self.indexer = KnowledgeBaseIndexer(kb_path, persist_dir)
             
-            logger.info("HybridRAGRetriever initialized successfully")
+            self._load_or_create_knowledge_base()
+            logger.info("HybridRAGRetriever initialized")
         except Exception as e:
-            logger.error(f"Failed to initialize RAG retriever: {e}")
+            logger.error(f"Failed to initialize RAG: {e}")
     
     def _initialize_embeddings(self):
-        """Initialize embedding model"""
+        """Initialize embeddings"""
         embedding_type = self.config.get("embedding_type", "huggingface")
         
-        try:
-            if embedding_type == "openai":
-                model = self.config.get("embedding_model", "text-embedding-3-small")
-                return OpenAIEmbeddings(model=model)
-            else:
-                model_name = self.config.get(
-                    "embedding_model", 
-                    "sentence-transformers/all-MiniLM-L6-v2"
-                )
-                return HuggingFaceEmbeddings(
-                    model_name=model_name,
-                    model_kwargs={'device': 'cpu'},
-                    encode_kwargs={'normalize_embeddings': True}
-                )
-        except Exception as e:
-            logger.error(f"Failed to initialize embeddings: {e}")
-            raise
+        if embedding_type == "openai":
+            return OpenAIEmbeddings(
+                model=self.config.get("embedding_model", "text-embedding-3-small")
+            )
+        else:
+            return HuggingFaceEmbeddings(
+                model_name=self.config.get("embedding_model", "sentence-transformers/all-MiniLM-L6-v2"),
+                model_kwargs={'device': 'cpu'},
+                encode_kwargs={'normalize_embeddings': True}
+            )
     
     def _initialize_reranker(self):
-        """Initialize cross-encoder reranker"""
+        """Initialize reranker"""
         try:
-            model_name = self.config.get(
-                "reranker_model",
-                "cross-encoder/ms-marco-MiniLM-L-6-v2"
-            )
+            model_name = self.config.get("reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2")
             model = HuggingFaceCrossEncoder(model_name=model_name)
             return CrossEncoderReranker(model=model, top_n=5)
         except Exception as e:
             logger.warning(f"Failed to initialize reranker: {e}")
             return None
     
-    def _load_knowledge_base(self):
-        """Load and index knowledge base documents"""
+    def _chroma_db_exists(self) -> bool:
+        """Check if Chroma DB exists"""
+        persist_dir = Path(self.config.get("persist_directory", "./chroma_db"))
+        
+        if not persist_dir.exists():
+            return False
+        
+        chroma_sqlite = persist_dir / "chroma.sqlite3"
+        if not chroma_sqlite.exists():
+            return False
+        
+        try:
+            test_store = Chroma(
+                persist_directory=str(persist_dir),
+                embedding_function=self.embeddings
+            )
+            if test_store._collection.count() > 0:
+                logger.info(f"Found existing Chroma DB with {test_store._collection.count()} embeddings")
+                return True
+        except Exception as e:
+            logger.warning(f"Error checking Chroma DB: {e}")
+        
+        return False
+    
+    def _load_or_create_knowledge_base(self):
+        """Load existing or create new knowledge base"""
+        db_exists = self._chroma_db_exists()
+        needs_update = self.indexer.needs_reindex()
+        
+        if db_exists and not needs_update:
+            logger.info("Loading existing Chroma DB (no changes)")
+            self._load_existing_db()
+        elif db_exists and needs_update:
+            logger.info("Performing incremental update")
+            self._incremental_update()
+        else:
+            logger.info("Creating new knowledge base")
+            self._create_new_db()
+    
+    def _load_existing_db(self):
+        """Load existing database"""
+        persist_dir = self.config.get("persist_directory", "./chroma_db")
+        
+        try:
+            self.vector_store = Chroma(
+                persist_directory=persist_dir,
+                embedding_function=self.embeddings
+            )
+            
+            chunks_file = Path(persist_dir) / "bm25_chunks.pkl"
+            if chunks_file.exists():
+                with open(chunks_file, 'rb') as f:
+                    self.all_chunks = pickle.load(f)
+                
+                self.bm25_retriever = BM25Retriever.from_documents(self.all_chunks)
+                self.bm25_retriever.k = self.config.get("top_k", 5)
+                logger.info(f"Loaded {len(self.all_chunks)} chunks")
+            else:
+                logger.warning("BM25 chunks file not found")
+        except Exception as e:
+            logger.error(f"Error loading DB: {e}")
+            self.vector_store = None
+            self.bm25_retriever = None
+    
+    def _create_new_db(self):
+        """Create new database"""
         kb_path = self.config.get("knowledge_base_path", "./circuit_knowledge_base")
         
         if not os.path.exists(kb_path):
-            logger.warning(f"Knowledge base path {kb_path} does not exist. Creating directory...")
             os.makedirs(kb_path, exist_ok=True)
+            logger.warning(f"Created knowledge base directory: {kb_path}")
             return
         
-        # Load documents
-        documents = self._load_documents(kb_path)
-        
+        documents = self._load_all_documents(kb_path)
         if not documents:
-            logger.warning("No documents loaded from knowledge base")
+            logger.warning("No documents found")
             return
         
-        # Split documents into chunks
+        self._split_and_index_documents(documents)
+        
+        all_files = []
+        for pattern in ["**/*.pdf", "**/*.docx", "**/*.txt"]:
+            all_files.extend(Path(kb_path).glob(pattern))
+        
+        self.indexer.update_metadata(all_files)
+        self.indexer.save()
+    
+    def _incremental_update(self):
+        """Perform incremental update"""
+        changes = self.indexer.scan_changes()
+        self._load_existing_db()
+        
+        if not self.vector_store:
+            logger.warning("Cannot load existing DB, creating new one")
+            self._create_new_db()
+            return
+        
+        if changes["deleted"]:
+            self._remove_documents(changes["deleted"])
+            self.indexer.remove_from_metadata(changes["deleted"])
+        
+        files_to_add = changes["added"] + changes["modified"]
+        if files_to_add:
+            if changes["modified"]:
+                self._remove_documents(changes["modified"])
+            
+            documents = self._load_documents_from_paths(files_to_add)
+            if documents:
+                self._add_documents_to_index(documents)
+            
+            self.indexer.update_metadata(files_to_add)
+        
+        self.indexer.save()
+        logger.info(f"Update complete: +{len(changes['added'])} ~{len(changes['modified'])} -{len(changes['deleted'])}")
+    
+    def _remove_documents(self, filepaths: List[Path]):
+        """Remove documents from indexes"""
+        try:
+            ids_to_remove = []
+            chunks_to_keep = []
+            
+            for chunk in self.all_chunks:
+                source = chunk.metadata.get("source", "")
+                if not any(str(fp) == source for fp in filepaths):
+                    chunks_to_keep.append(chunk)
+                else:
+                    chunk_id = chunk.metadata.get("id")
+                    if chunk_id:
+                        ids_to_remove.append(chunk_id)
+            
+            if ids_to_remove and self.vector_store:
+                self.vector_store._collection.delete(ids=ids_to_remove)
+                logger.info(f"Removed {len(ids_to_remove)} chunks")
+            
+            self.all_chunks = chunks_to_keep
+            
+            if self.all_chunks:
+                self.bm25_retriever = BM25Retriever.from_documents(self.all_chunks)
+                self.bm25_retriever.k = self.config.get("top_k", 5)
+            
+            self._save_bm25_chunks()
+        except Exception as e:
+            logger.error(f"Error removing documents: {e}")
+    
+    def _add_documents_to_index(self, documents: List[Document]):
+        """Add documents to index"""
+        if not documents:
+            return
+        
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=self.config.get("chunk_size", 512),
+            chunk_overlap=self.config.get("chunk_overlap", 50),
+            separators=["\n\n", "\n", ". ", " ", ""]
+        )
+        new_chunks = text_splitter.split_documents(documents)
+        
+        for i, chunk in enumerate(new_chunks):
+            chunk.metadata["id"] = f"chunk_{len(self.all_chunks) + i}"
+        
+        if self.vector_store:
+            self.vector_store.add_documents(new_chunks)
+            logger.info(f"Added {len(new_chunks)} chunks")
+        
+        self.all_chunks.extend(new_chunks)
+        
+        self.bm25_retriever = BM25Retriever.from_documents(self.all_chunks)
+        self.bm25_retriever.k = self.config.get("top_k", 5)
+        
+        self._save_bm25_chunks()
+        logger.info(f"Total chunks: {len(self.all_chunks)}")
+    
+    def _save_bm25_chunks(self):
+        """Save BM25 chunks"""
+        persist_dir = Path(self.config.get("persist_directory", "./chroma_db"))
+        chunks_file = persist_dir / "bm25_chunks.pkl"
+        
+        try:
+            with open(chunks_file, 'wb') as f:
+                pickle.dump(self.all_chunks, f)
+        except Exception as e:
+            logger.error(f"Error saving chunks: {e}")
+    
+    def _split_and_index_documents(self, documents: List[Document]):
+        """Split and index documents"""
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.config.get("chunk_size", 512),
             chunk_overlap=self.config.get("chunk_overlap", 50),
@@ -217,521 +464,356 @@ class HybridRAGRetriever:
         )
         chunks = text_splitter.split_documents(documents)
         
-        logger.info(f"Loaded {len(documents)} documents, split into {len(chunks)} chunks")
+        for i, chunk in enumerate(chunks):
+            chunk.metadata["id"] = f"chunk_{i}"
         
-        # Create vector store
+        self.all_chunks = chunks
+        logger.info(f"Split {len(documents)} documents into {len(chunks)} chunks")
+        
         try:
             persist_dir = self.config.get("persist_directory", "./chroma_db")
-            os.makedirs(persist_dir, exist_ok=True)
-            
             self.vector_store = Chroma.from_documents(
                 documents=chunks,
                 embedding=self.embeddings,
                 persist_directory=persist_dir
             )
-            logger.info(f"Vector store created with {len(chunks)} chunks")
+            logger.info("Vector store created")
         except Exception as e:
             logger.error(f"Failed to create vector store: {e}")
             self.vector_store = None
         
-        # Create BM25 retriever
         try:
             self.bm25_retriever = BM25Retriever.from_documents(chunks)
             self.bm25_retriever.k = self.config.get("top_k", 5)
-            logger.info("BM25 retriever created successfully")
+            logger.info("BM25 retriever created")
         except Exception as e:
             logger.error(f"Failed to create BM25 retriever: {e}")
             self.bm25_retriever = None
+        
+        self._save_bm25_chunks()
     
-    def _load_documents(self, kb_path: str) -> List[Document]:
-        """Load documents from knowledge base directory"""
+    def _load_documents_from_paths(self, paths: List[Path]) -> List[Document]:
+        """Load documents from paths"""
         documents = []
         
-        # Load PDFs
-        try:
-            pdf_loader = DirectoryLoader(
-                kb_path,
-                glob="**/*.pdf",
-                loader_cls=PyPDFLoader,
-                show_progress=False,
-                silent_errors=True
-            )
-            pdf_docs = pdf_loader.load()
-            documents.extend(pdf_docs)
-            logger.info(f"Loaded {len(pdf_docs)} PDF documents")
-        except Exception as e:
-            logger.warning(f"Error loading PDFs: {e}")
-        
-        # Load DOCX files
-        try:
-            docx_loader = DirectoryLoader(
-                kb_path,
-                glob="**/*.docx",
-                loader_cls=Docx2txtLoader,
-                show_progress=False,
-                silent_errors=True
-            )
-            docx_docs = docx_loader.load()
-            documents.extend(docx_docs)
-            logger.info(f"Loaded {len(docx_docs)} DOCX documents")
-        except Exception as e:
-            logger.warning(f"Error loading DOCX files: {e}")
-        
-        # Load text files
-        try:
-            txt_loader = DirectoryLoader(
-                kb_path,
-                glob="**/*.txt",
-                loader_cls=TextLoader,
-                show_progress=False,
-                silent_errors=True
-            )
-            txt_docs = txt_loader.load()
-            documents.extend(txt_docs)
-            logger.info(f"Loaded {len(txt_docs)} text documents")
-        except Exception as e:
-            logger.warning(f"Error loading text files: {e}")
+        for filepath in paths:
+            if not filepath.exists():
+                continue
+            
+            try:
+                suffix = filepath.suffix.lower()
+                
+                if suffix == '.pdf':
+                    loader = PyPDFLoader(str(filepath))
+                elif suffix == '.docx':
+                    loader = Docx2txtLoader(str(filepath))
+                elif suffix == '.txt':
+                    loader = TextLoader(str(filepath))
+                else:
+                    continue
+                
+                docs = loader.load()
+                documents.extend(docs)
+                logger.info(f"Loaded {filepath.name}: {len(docs)} pages")
+            except Exception as e:
+                logger.warning(f"Error loading {filepath.name}: {e}")
         
         return documents
     
-    def retrieve(
-        self, 
-        query: str, 
-        circuit_context: Optional[Dict[str, Any]] = None,
-        top_k: int = 5
-    ) -> str:
-        """
-        Perform hybrid retrieval with optional circuit context
+    def _load_all_documents(self, kb_path: str) -> List[Document]:
+        """Load all documents from directory"""
+        documents = []
         
-        Args:
-            query: Search query
-            circuit_context: Optional circuit-specific context
-            top_k: Number of results to return
-            
-        Returns:
-            Formatted context string
-        """
+        for loader_cls, pattern in [(PyPDFLoader, "**/*.pdf"), 
+                                     (Docx2txtLoader, "**/*.docx"), 
+                                     (TextLoader, "**/*.txt")]:
+            try:
+                loader = DirectoryLoader(
+                    kb_path,
+                    glob=pattern,
+                    loader_cls=loader_cls,
+                    show_progress=False,
+                    silent_errors=True
+                )
+                docs = loader.load()
+                documents.extend(docs)
+                logger.info(f"Loaded {len(docs)} {pattern} files")
+            except Exception as e:
+                logger.warning(f"Error loading {pattern}: {e}")
         
+        return documents
+    
+    def force_reindex(self):
+        """Force complete reindex"""
+        logger.info("Forcing complete reindex")
+        self.indexer.file_metadata = {}
+        self._create_new_db()
+    
+    def retrieve(self, query: str, circuit_context: Optional[Dict[str, Any]] = None, top_k: int = 5) -> str:
+        """Retrieve relevant context"""
         if not self.vector_store or not self.bm25_retriever:
-            logger.warning("RAG system not fully initialized, returning limited context")
-            return "Knowledge base not available or not fully initialized."
+            return "Knowledge base not available"
         
-        # Enhance query with circuit context
         enhanced_query = self._enhance_query(query, circuit_context)
         
         try:
-            # Dense retrieval
-            dense_retriever = self.vector_store.as_retriever(
-                search_kwargs={"k": top_k * 2}
-            )
-            
-            # Create ensemble retriever
+            dense_retriever = self.vector_store.as_retriever(search_kwargs={"k": top_k * 2})
             ensemble_retriever = EnsembleRetriever(
                 retrievers=[dense_retriever, self.bm25_retriever],
-                weights=[0.7, 0.3]  # Favor dense retrieval
+                weights=[0.7, 0.3]
             )
             
-            # Add reranking if available
             if self.reranker:
-                compression_retriever = ContextualCompressionRetriever(
+                retriever = ContextualCompressionRetriever(
                     base_compressor=self.reranker,
                     base_retriever=ensemble_retriever
                 )
-                docs = compression_retriever.get_relevant_documents(enhanced_query)
+                docs = retriever.get_relevant_documents(enhanced_query)
             else:
                 docs = ensemble_retriever.get_relevant_documents(enhanced_query)
             
-            # Format context
-            context = self._format_context(docs, circuit_context)
-            return context
-            
+            return self._format_context(docs, circuit_context)
         except Exception as e:
             logger.error(f"Retrieval error: {e}")
-            return f"Error retrieving context from knowledge base: {str(e)}"
+            return f"Error retrieving context: {str(e)}"
     
-    def _enhance_query(
-        self, 
-        query: str, 
-        circuit_context: Optional[Dict[str, Any]]
-    ) -> str:
-        """Enhance query with circuit-specific context"""
-        
+    def _enhance_query(self, query: str, circuit_context: Optional[Dict[str, Any]]) -> str:
+        """Enhance query with context"""
         if not circuit_context:
             return query
         
-        enhancements = [query]
-        
+        parts = [query]
         if circuit_context.get("circuit_type"):
-            enhancements.append(f"Circuit type: {circuit_context['circuit_type']}")
-        
+            parts.append(f"Circuit type: {circuit_context['circuit_type']}")
         if circuit_context.get("components"):
-            components = ", ".join(circuit_context["components"])
-            enhancements.append(f"Components: {components}")
+            parts.append(f"Components: {', '.join(circuit_context['components'])}")
         
-        if circuit_context.get("analysis_type"):
-            enhancements.append(f"Analysis: {circuit_context['analysis_type']}")
-        
-        return " | ".join(enhancements)
+        return " | ".join(parts)
     
-    def _format_context(
-        self, 
-        docs: List[Document], 
-        circuit_context: Optional[Dict[str, Any]]
-    ) -> str:
-        """Format retrieved documents into context string"""
+    def _format_context(self, docs: List[Document], circuit_context: Optional[Dict[str, Any]]) -> str:
+        """Format context"""
+        parts = []
         
-        context_parts = []
-        
-        # Add circuit context if available
         if circuit_context:
-            context_parts.append("=== CIRCUIT CONTEXT ===")
+            parts.append("=== CIRCUIT CONTEXT ===")
             if circuit_context.get("circuit_type"):
-                context_parts.append(f"Circuit Type: {circuit_context['circuit_type']}")
+                parts.append(f"Circuit Type: {circuit_context['circuit_type']}")
             if circuit_context.get("components"):
-                context_parts.append(f"Components: {', '.join(circuit_context['components'])}")
-            context_parts.append("")
+                parts.append(f"Components: {', '.join(circuit_context['components'])}")
+            parts.append("")
         
-        # Add retrieved knowledge
-        context_parts.append("=== RETRIEVED KNOWLEDGE ===")
-        
+        parts.append("=== RETRIEVED KNOWLEDGE ===")
         for i, doc in enumerate(docs, 1):
-            source = doc.metadata.get("source", "Unknown")
-            content = doc.page_content.strip()
-            context_parts.append(f"\n[Source {i}] {os.path.basename(source)}")
-            context_parts.append(content)
-            context_parts.append("-" * 50)
+            source = os.path.basename(doc.metadata.get("source", "Unknown"))
+            parts.append(f"\n[Source {i}] {source}")
+            parts.append(doc.page_content.strip())
+            parts.append("-" * 50)
         
-        return "\n".join(context_parts)
+        return "\n".join(parts)
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get statistics"""
+        return {
+            "total_chunks": len(self.all_chunks),
+            "indexed_files": len(self.indexer.file_metadata),
+            "vector_store_ready": self.vector_store is not None,
+            "bm25_ready": self.bm25_retriever is not None,
+            "reranker_ready": self.reranker is not None
+        }
 
 
-# ==================== CIRCUIT SIMULATION WITH PYSPICE ====================
+# ==================== PYSPICE SIMULATOR ====================
 
 class PySpiceSimulator:
-    """
-    Circuit simulator using PySpice library
-    """
+    """Circuit simulator using PySpice"""
     
     def __init__(self):
         self.pyspice_available = PYSPICE_AVAILABLE
-        if not self.pyspice_available:
-            logger.warning("PySpice not available. Install with: pip install PySpice")
+        if not PYSPICE_AVAILABLE:
+            logger.warning("PySpice not available")
         else:
             logger.info("PySpice simulator initialized")
     
     def simulate(self, netlist: str) -> SimulationResult:
-        """
-        Simulate a SPICE netlist using PySpice
-        
-        Args:
-            netlist: SPICE netlist string
-            
-        Returns:
-            SimulationResult with parsed results
-        """
-        
+        """Simulate SPICE netlist"""
         if not self.pyspice_available:
             return SimulationResult(
                 success=False,
-                error_message="PySpice not available. Please install PySpice: pip install PySpice"
+                error_message="PySpice not available. Install with: pip install PySpice"
             )
         
-        # Validate netlist
         validation_errors = self._validate_netlist(netlist)
         if validation_errors:
             return SimulationResult(
                 success=False,
-                error_message=f"Netlist validation failed: {'; '.join(validation_errors)}"
+                error_message=f"Validation failed: {'; '.join(validation_errors)}"
             )
         
         try:
-            # Parse the netlist and create circuit
             circuit_info = self._parse_netlist(netlist)
-            
             if circuit_info.get("error"):
-                return SimulationResult(
-                    success=False,
-                    error_message=circuit_info["error"]
-                )
+                return SimulationResult(success=False, error_message=circuit_info["error"])
             
-            # Create PySpice circuit
-            circuit = self._create_pyspice_circuit(circuit_info)
+            circuit = self._create_circuit(circuit_info)
+            if not circuit:
+                return SimulationResult(success=False, error_message="Failed to create circuit")
             
-            if circuit is None:
-                return SimulationResult(
-                    success=False,
-                    error_message="Failed to create PySpice circuit"
-                )
-            
-            # Run simulation based on analysis type
-            results = self._run_simulation(circuit, circuit_info)
-            
-            return results
-            
+            return self._run_simulation(circuit, circuit_info)
         except Exception as e:
             logger.error(f"Simulation error: {e}")
-            return SimulationResult(
-                success=False,
-                error_message=f"Simulation exception: {str(e)}"
-            )
+            return SimulationResult(success=False, error_message=str(e))
     
     def _validate_netlist(self, netlist: str) -> List[str]:
-        """Validate SPICE netlist syntax"""
+        """Validate netlist"""
         errors = []
-        
         if not netlist or not netlist.strip():
-            errors.append("Empty netlist")
-            return errors
+            return ["Empty netlist"]
         
         lines = netlist.strip().split('\n')
-        
-        has_ground = False
-        has_component = False
-        has_analysis = False
+        has_ground = has_component = has_analysis = False
         
         for line in lines:
             line = line.strip()
             if not line or line.startswith('*'):
                 continue
             
-            # Check for ground node (0 or GND)
             if '0' in line.split() or 'GND' in line.upper():
                 has_ground = True
-            
-            # Check for components
             if line and line[0].upper() in 'RCLDVIQMXBEFGHJKSTUW':
                 has_component = True
-            
-            # Check for analysis commands
             if line.startswith('.') and line.split()[0].upper() in ['.OP', '.DC', '.AC', '.TRAN']:
                 has_analysis = True
         
         if not has_ground:
-            errors.append("No ground node (0 or GND) found")
+            errors.append("No ground node")
         if not has_component:
-            errors.append("No circuit components found")
-        if not has_analysis:
-            logger.warning("No analysis command found, will default to .OP")
+            errors.append("No components")
         
         return errors
     
     def _parse_netlist(self, netlist: str) -> Dict[str, Any]:
-        """Parse SPICE netlist into structured format"""
+        """Parse netlist"""
         lines = netlist.strip().split('\n')
-        
-        circuit_info = {
-            "title": "Circuit",
-            "components": [],
-            "analysis": [],
-            "options": []
-        }
+        info = {"title": "Circuit", "components": [], "analysis": [], "options": []}
         
         for line in lines:
             line = line.strip()
-            if not line or line.startswith('*'):
+            if not line or line.startswith('*') or line.upper() == '.END':
                 continue
             
-            if line.upper() == '.END':
-                continue
-            
-            # Parse title (first non-comment line)
-            if not circuit_info.get("title_set"):
-                if not line.startswith('.') and line[0].upper() not in 'RCLDVIQMXBEFGHJKSTUW':
-                    circuit_info["title"] = line
-                    circuit_info["title_set"] = True
-                    continue
-            
-            # Parse components
             if line and line[0].upper() in 'RCLDVIQMXBEFGHJKSTUW':
-                circuit_info["components"].append(self._parse_component(line))
-            
-            # Parse analysis commands
+                info["components"].append(self._parse_component(line))
             elif line.startswith('.'):
                 cmd = line.split()[0].upper()
                 if cmd in ['.OP', '.DC', '.AC', '.TRAN']:
-                    circuit_info["analysis"].append({
-                        "type": cmd[1:],
-                        "command": line
-                    })
-                elif cmd in ['.OPTIONS', '.OPTION']:
-                    circuit_info["options"].append(line)
+                    info["analysis"].append({"type": cmd[1:], "command": line})
         
-        # Default to operating point if no analysis specified
-        if not circuit_info["analysis"]:
-            circuit_info["analysis"].append({
-                "type": "OP",
-                "command": ".OP"
-            })
+        if not info["analysis"]:
+            info["analysis"].append({"type": "OP", "command": ".OP"})
         
-        return circuit_info
+        return info
     
     def _parse_component(self, line: str) -> Dict[str, Any]:
-        """Parse a component line"""
+        """Parse component line"""
         parts = line.split()
-        comp_type = line[0].upper()
-        
-        component = {
-            "type": comp_type,
+        return {
+            "type": line[0].upper(),
             "name": parts[0],
+            "nodes": parts[1:3] if len(parts) >= 3 else [],
+            "value": ' '.join(parts[3:]) if len(parts) > 3 else "",
             "raw": line
         }
-        
-        try:
-            if comp_type == 'R':  # Resistor
-                component["nodes"] = [parts[1], parts[2]]
-                component["value"] = parts[3]
-            elif comp_type == 'C':  # Capacitor
-                component["nodes"] = [parts[1], parts[2]]
-                component["value"] = parts[3]
-            elif comp_type == 'L':  # Inductor
-                component["nodes"] = [parts[1], parts[2]]
-                component["value"] = parts[3]
-            elif comp_type == 'V':  # Voltage source
-                component["nodes"] = [parts[1], parts[2]]
-                component["value"] = ' '.join(parts[3:])
-            elif comp_type == 'I':  # Current source
-                component["nodes"] = [parts[1], parts[2]]
-                component["value"] = ' '.join(parts[3:])
-        except IndexError:
-            component["error"] = "Malformed component line"
-        
-        return component
     
-    def _create_pyspice_circuit(self, circuit_info: Dict[str, Any]) -> Optional[Circuit]:
-        """Create PySpice Circuit object from parsed netlist"""
+    def _create_circuit(self, info: Dict[str, Any]) -> Optional[Circuit]:
+        """Create PySpice circuit"""
         try:
-            circuit = Circuit(circuit_info["title"])
+            circuit = Circuit(info["title"])
             
-            for comp in circuit_info["components"]:
+            for comp in info["components"]:
                 comp_type = comp["type"]
-                name = comp["name"][1:]  # Remove type prefix
-                nodes = comp.get("nodes", [])
+                name = comp["name"][1:]
+                nodes = [n if n.upper() != 'GND' else '0' for n in comp.get("nodes", [])]
                 value_str = comp.get("value", "")
                 
-                # Replace GND with 0
-                nodes = [n if n.upper() != 'GND' else '0' for n in nodes]
-                
                 try:
+                    value = self._parse_value(value_str.split()[0] if value_str else "1")
+                    
                     if comp_type == 'R':
-                        # Parse resistance value
-                        value = self._parse_value(value_str)
                         circuit.R(name, nodes[0], nodes[1], value)
-                    
                     elif comp_type == 'C':
-                        value = self._parse_value(value_str)
                         circuit.C(name, nodes[0], nodes[1], value)
-                    
                     elif comp_type == 'L':
-                        value = self._parse_value(value_str)
                         circuit.L(name, nodes[0], nodes[1], value)
-                    
                     elif comp_type == 'V':
-                        # Parse voltage source
-                        if 'DC' in value_str.upper():
-                            dc_value = self._extract_dc_value(value_str)
-                            circuit.V(name, nodes[0], nodes[1], dc_value)
-                        else:
-                            # Try to parse as direct value
-                            try:
-                                dc_value = self._parse_value(value_str.split()[0])
-                                circuit.V(name, nodes[0], nodes[1], dc_value)
-                            except:
-                                circuit.V(name, nodes[0], nodes[1], 0)
-                    
+                        dc_val = self._extract_dc_value(value_str) if 'DC' in value_str.upper() else value
+                        circuit.V(name, nodes[0], nodes[1], dc_val)
                     elif comp_type == 'I':
-                        if 'DC' in value_str.upper():
-                            dc_value = self._extract_dc_value(value_str)
-                            circuit.I(name, nodes[0], nodes[1], dc_value)
-                        else:
-                            try:
-                                dc_value = self._parse_value(value_str.split()[0])
-                                circuit.I(name, nodes[0], nodes[1], dc_value)
-                            except:
-                                circuit.I(name, nodes[0], nodes[1], 0)
-                
+                        dc_val = self._extract_dc_value(value_str) if 'DC' in value_str.upper() else value
+                        circuit.I(name, nodes[0], nodes[1], dc_val)
                 except Exception as e:
-                    logger.warning(f"Error adding component {comp['name']}: {e}")
-                    continue
+                    logger.warning(f"Error adding {comp['name']}: {e}")
             
             return circuit
-            
         except Exception as e:
             logger.error(f"Error creating circuit: {e}")
             return None
     
     def _parse_value(self, value_str: str) -> float:
-        """Parse component value with SI prefixes"""
+        """Parse value with SI prefixes"""
         value_str = value_str.strip().upper()
-        
-        # SI prefix multipliers
         multipliers = {
             'T': 1e12, 'G': 1e9, 'MEG': 1e6, 'X': 1e6,
             'K': 1e3, 'M': 1e-3, 'U': 1e-6, 'N': 1e-9,
             'P': 1e-12, 'F': 1e-15
         }
         
-        # Extract number and suffix
         match = re.match(r'([-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?)\s*([A-Z]*)', value_str)
         if match:
             number = float(match.group(1))
             suffix = match.group(3)
-            
-            # Check for SI prefix
             for prefix, mult in multipliers.items():
                 if suffix.startswith(prefix):
                     return number * mult
-            
             return number
         
-        # Fallback
         try:
             return float(value_str)
         except:
-            return 1.0  # Default value
+            return 1.0
     
     def _extract_dc_value(self, value_str: str) -> float:
-        """Extract DC value from voltage/current source specification"""
+        """Extract DC value"""
         parts = value_str.upper().split()
         for i, part in enumerate(parts):
             if part == 'DC' and i + 1 < len(parts):
                 return self._parse_value(parts[i + 1])
         return 0.0
     
-    def _run_simulation(self, circuit: Circuit, circuit_info: Dict[str, Any]) -> SimulationResult:
-        """Run simulation on PySpice circuit"""
+    def _run_simulation(self, circuit: Circuit, info: Dict[str, Any]) -> SimulationResult:
+        """Run simulation"""
         try:
-            from PySpice.Spice.Netlist import Circuit as SpiceCircuit
-            
-            # Create simulator
             simulator = circuit.simulator(temperature=25, nominal_temperature=25)
-            
             results = SimulationResult(success=True)
             
-            # Run each analysis
-            for analysis in circuit_info["analysis"]:
+            for analysis in info["analysis"]:
                 analysis_type = analysis["type"]
                 
                 try:
                     if analysis_type == "OP":
-                        # Operating point analysis
                         analysis_result = simulator.operating_point()
-                        
-                        # Extract node voltages
                         op_results = {}
                         for node in analysis_result.nodes.values():
                             node_name = str(node)
-                            if node_name != '0':  # Skip ground
+                            if node_name != '0':
                                 try:
                                     op_results[node_name] = float(node)
                                 except:
                                     pass
-                        
                         results.operating_point = op_results
                         results.dc_analysis = op_results
-                        logger.info(f"Operating point analysis completed: {len(op_results)} nodes")
+                        logger.info(f"OP analysis: {len(op_results)} nodes")
                     
                     elif analysis_type == "DC":
-                        # DC sweep analysis
-                        # Parse DC command
                         cmd_parts = analysis["command"].split()
                         if len(cmd_parts) >= 5:
                             source = cmd_parts[1]
@@ -739,15 +821,8 @@ class PySpiceSimulator:
                             stop = self._parse_value(cmd_parts[3])
                             step = self._parse_value(cmd_parts[4])
                             
-                            analysis_result = simulator.dc(
-                                **{source: slice(start, stop, step)}
-                            )
-                            
-                            # Extract results
-                            dc_results = {
-                                "sweep_variable": source,
-                                "data": {}
-                            }
+                            analysis_result = simulator.dc(**{source: slice(start, stop, step)})
+                            dc_results = {"sweep_variable": source, "data": {}}
                             
                             for node in analysis_result.nodes.values():
                                 node_name = str(node)
@@ -755,13 +830,12 @@ class PySpiceSimulator:
                                     dc_results["data"][node_name] = list(node)
                             
                             results.dc_analysis = dc_results
-                            logger.info("DC sweep analysis completed")
+                            logger.info("DC sweep analysis complete")
                     
                     elif analysis_type == "AC":
-                        # AC analysis
                         cmd_parts = analysis["command"].split()
-                        if len(cmd_parts) >= 4:
-                            variation = cmd_parts[1]  # DEC, OCT, LIN
+                        if len(cmd_parts) >= 5:
+                            variation = cmd_parts[1]
                             points = int(cmd_parts[2])
                             fstart = self._parse_value(cmd_parts[3])
                             fstop = self._parse_value(cmd_parts[4])
@@ -773,12 +847,7 @@ class PySpiceSimulator:
                                 variation=variation.lower()
                             )
                             
-                            # Extract results
-                            ac_results = {
-                                "frequency": list(analysis_result.frequency),
-                                "data": {}
-                            }
-                            
+                            ac_results = {"frequency": list(analysis_result.frequency), "data": {}}
                             for node in analysis_result.nodes.values():
                                 node_name = str(node)
                                 if node_name != '0':
@@ -788,17 +857,14 @@ class PySpiceSimulator:
                                     }
                             
                             results.ac_analysis = ac_results
-                            logger.info("AC analysis completed")
+                            logger.info("AC analysis complete")
                     
                     elif analysis_type == "TRAN":
-                        # Transient analysis
                         cmd_parts = analysis["command"].split()
                         if len(cmd_parts) >= 3:
                             tstep = self._parse_value(cmd_parts[1])
                             tstop = self._parse_value(cmd_parts[2])
-                            tstart = 0
-                            if len(cmd_parts) >= 4:
-                                tstart = self._parse_value(cmd_parts[3])
+                            tstart = self._parse_value(cmd_parts[3]) if len(cmd_parts) >= 4 else 0
                             
                             analysis_result = simulator.transient(
                                 step_time=tstep,
@@ -806,50 +872,38 @@ class PySpiceSimulator:
                                 start_time=tstart
                             )
                             
-                            # Extract results
-                            tran_results = {
-                                "time": list(analysis_result.time),
-                                "data": {}
-                            }
-                            
+                            tran_results = {"time": list(analysis_result.time), "data": {}}
                             for node in analysis_result.nodes.values():
                                 node_name = str(node)
                                 if node_name != '0':
                                     tran_results["data"][node_name] = list(node)
                             
                             results.transient_analysis = tran_results
-                            logger.info("Transient analysis completed")
+                            logger.info("Transient analysis complete")
                 
                 except Exception as e:
                     logger.error(f"Error in {analysis_type} analysis: {e}")
                     if not results.error_message:
-                        results.error_message = f"{analysis_type} analysis failed: {str(e)}"
+                        results.error_message = f"{analysis_type} failed: {str(e)}"
             
-            # Check if we got any results
-            if not (results.operating_point or results.dc_analysis or 
-                   results.ac_analysis or results.transient_analysis):
+            if not (results.operating_point or results.dc_analysis or results.ac_analysis or results.transient_analysis):
                 results.success = False
-                results.error_message = "No analysis results obtained"
+                results.error_message = "No analysis results"
             
             return results
-            
         except Exception as e:
-            logger.error(f"Simulation execution error: {e}")
-            return SimulationResult(
-                success=False,
-                error_message=f"Simulation execution error: {str(e)}"
-            )
+            logger.error(f"Simulation error: {e}")
+            return SimulationResult(success=False, error_message=str(e))
 
 
 # ==================== GLOBAL INSTANCES ====================
 
-# These will be initialized by the engine
 _simulator_instance = None
 _rag_instance = None
 
 
 def get_simulator() -> PySpiceSimulator:
-    """Get or create simulator instance"""
+    """Get simulator instance"""
     global _simulator_instance
     if _simulator_instance is None:
         _simulator_instance = PySpiceSimulator()
@@ -857,7 +911,7 @@ def get_simulator() -> PySpiceSimulator:
 
 
 def get_rag_retriever() -> Optional[HybridRAGRetriever]:
-    """Get RAG retriever instance"""
+    """Get RAG instance"""
     return _rag_instance
 
 
@@ -865,60 +919,27 @@ def get_rag_retriever() -> Optional[HybridRAGRetriever]:
 
 @tool
 def simulate_circuit(netlist: str) -> Dict[str, Any]:
-    """
-    Simulate a SPICE circuit netlist using PySpice.
-    
-    Args:
-        netlist: SPICE netlist string
-        
-    Returns:
-        Dictionary containing simulation results
-    """
-    simulator = get_simulator()
-    result = simulator.simulate(netlist)
-    return result.dict()
+    """Simulate SPICE netlist"""
+    return get_simulator().simulate(netlist).dict()
 
 
 @tool
 def retrieve_knowledge(query: str, circuit_type: str = "general") -> str:
-    """
-    Retrieve relevant knowledge from the circuit analysis knowledge base.
-    
-    Args:
-        query: Search query describing what information is needed
-        circuit_type: Type of circuit (analog, digital, general)
-        
-    Returns:
-        Formatted context string with relevant knowledge
-    """
+    """Retrieve knowledge from knowledge base"""
     rag = get_rag_retriever()
     if rag:
-        circuit_context = {"circuit_type": circuit_type}
-        return rag.retrieve(query, circuit_context)
-    return "Knowledge base not available."
+        return rag.retrieve(query, {"circuit_type": circuit_type})
+    return "Knowledge base not available"
 
 
 @tool
 def analyze_components(netlist: str) -> Dict[str, Any]:
-    """
-    Analyze circuit components from netlist.
-    
-    Args:
-        netlist: SPICE netlist string
-        
-    Returns:
-        Dictionary with component analysis
-    """
+    """Analyze circuit components"""
     lines = netlist.strip().split('\n')
     components = {
-        "resistors": [],
-        "capacitors": [],
-        "inductors": [],
-        "voltage_sources": [],
-        "current_sources": [],
-        "diodes": [],
-        "transistors": [],
-        "other": []
+        "resistors": [], "capacitors": [], "inductors": [],
+        "voltage_sources": [], "current_sources": [],
+        "diodes": [], "transistors": [], "other": []
     }
     
     for line in lines:
@@ -926,45 +947,40 @@ def analyze_components(netlist: str) -> Dict[str, Any]:
         if not line or line.startswith('*') or line.startswith('.'):
             continue
         
-        if not line:
-            continue
-            
-        component_type = line[0].upper()
-        
-        if component_type == 'R':
+        comp_type = line[0].upper()
+        if comp_type == 'R':
             components["resistors"].append(line)
-        elif component_type == 'C':
+        elif comp_type == 'C':
             components["capacitors"].append(line)
-        elif component_type == 'L':
+        elif comp_type == 'L':
             components["inductors"].append(line)
-        elif component_type == 'V':
+        elif comp_type == 'V':
             components["voltage_sources"].append(line)
-        elif component_type == 'I':
+        elif comp_type == 'I':
             components["current_sources"].append(line)
-        elif component_type == 'D':
+        elif comp_type == 'D':
             components["diodes"].append(line)
-        elif component_type in ['Q', 'M']:
+        elif comp_type in ['Q', 'M']:
             components["transistors"].append(line)
         else:
             components["other"].append(line)
     
-    # Calculate summary
     summary = {k: len(v) for k, v in components.items() if v}
-    total_components = sum(summary.values())
+    total = sum(summary.values())
     
     return {
         "summary": summary,
-        "total_components": total_components,
+        "total_components": total,
         "details": components,
-        "circuit_complexity": "simple" if total_components < 5 else "moderate" if total_components < 15 else "complex"
+        "circuit_complexity": "simple" if total < 5 else "moderate" if total < 15 else "complex"
     }
 
 
-# ==================== LANGGRAPH WORKFLOW NODES ====================
+# ==================== WORKFLOW NODES ====================
 
 def initialize_state(state: CircuitAnalysisState) -> CircuitAnalysisState:
-    """Initialize the analysis state"""
-    logger.info("Initializing circuit analysis state")
+    """Initialize state"""
+    logger.info("Initializing analysis state")
     
     state["iteration"] = 0
     state["max_iterations"] = state.get("max_iterations", 10)
@@ -974,15 +990,14 @@ def initialize_state(state: CircuitAnalysisState) -> CircuitAnalysisState:
     state["reasoning_steps"] = []
     state["retrieval_queries"] = []
     
-    # Add initial system message
     system_msg = SystemMessage(content="""You are an expert circuit analysis AI assistant.
-You help students and engineers understand and solve circuit problems by:
+You help students and engineers by:
 1. Analyzing circuit netlists and diagrams
 2. Running simulations to verify behavior
-3. Retrieving relevant circuit theory knowledge
+3. Retrieving relevant circuit theory
 4. Providing step-by-step explanations
 
-Always think carefully and show your reasoning. Be thorough and educational.""")
+Be thorough and educational.""")
     
     if "messages" not in state or not state["messages"]:
         state["messages"] = [system_msg]
@@ -991,51 +1006,39 @@ Always think carefully and show your reasoning. Be thorough and educational.""")
 
 
 def decide_next_action(state: CircuitAnalysisState) -> CircuitAnalysisState:
-    """Decide what action to take next based on current state"""
+    """Decide next action"""
     logger.info(f"Deciding next action (iteration {state['iteration']})")
     
-    # Check iteration limit
     if state["iteration"] >= state["max_iterations"]:
-        logger.info("Max iterations reached, generating answer")
         state["next_action"] = "generate_answer"
         return state
     
-    # Decision logic based on what's been done
     if not state.get("retrieved_context"):
         state["next_action"] = "retrieve_knowledge"
-        logger.info("Next action: retrieve_knowledge (no context yet)")
     elif not state.get("simulation_attempted") and state.get("netlist"):
         state["next_action"] = "simulate_circuit"
-        logger.info("Next action: simulate_circuit (netlist available, not yet simulated)")
-    elif state.get("simulation_attempted") and not state.get("answer_generated"):
-        state["next_action"] = "generate_answer"
-        logger.info("Next action: generate_answer (have context and simulation)")
     else:
         state["next_action"] = "generate_answer"
-        logger.info("Next action: generate_answer (fallback)")
     
     return state
 
 
 def retrieve_knowledge_node(state: CircuitAnalysisState) -> CircuitAnalysisState:
-    """Retrieve relevant knowledge using Hybrid RAG"""
-    logger.info("Retrieving knowledge from RAG system")
+    """Retrieve knowledge"""
+    logger.info("Retrieving knowledge")
     
     rag = get_rag_retriever()
     if not rag:
-        logger.warning("RAG retriever not available")
-        state["retrieved_context"] = "Knowledge base not available."
+        state["retrieved_context"] = "Knowledge base not available"
         state["iteration"] += 1
         return state
     
-    # Prepare circuit context
     circuit_context = {
         "circuit_type": state.get("circuit_type", "unknown"),
         "components": [],
         "analysis_type": "general"
     }
     
-    # Extract component info if netlist is available
     if state.get("netlist"):
         try:
             comp_analysis = analyze_components.invoke({"netlist": state["netlist"]})
@@ -1044,31 +1047,24 @@ def retrieve_knowledge_node(state: CircuitAnalysisState) -> CircuitAnalysisState
         except Exception as e:
             logger.warning(f"Could not analyze components: {e}")
     
-    # Retrieve context
     try:
-        context = rag.retrieve(
-            query=state["question"],
-            circuit_context=circuit_context,
-            top_k=5
-        )
+        context = rag.retrieve(state["question"], circuit_context, top_k=5)
         state["retrieved_context"] = context
         state["retrieval_queries"].append(state["question"])
         
-        # Add to reasoning steps
         state["reasoning_steps"].append({
             "step": len(state["reasoning_steps"]) + 1,
             "action": "retrieve_knowledge",
-            "result": "Successfully retrieved relevant context",
+            "result": "Success",
             "timestamp": datetime.now().isoformat()
         })
-        
     except Exception as e:
-        logger.error(f"Knowledge retrieval failed: {e}")
-        state["retrieved_context"] = f"Error retrieving knowledge: {str(e)}"
+        logger.error(f"Retrieval failed: {e}")
+        state["retrieved_context"] = f"Error: {str(e)}"
         state["reasoning_steps"].append({
             "step": len(state["reasoning_steps"]) + 1,
             "action": "retrieve_knowledge",
-            "result": "Failed to retrieve context",
+            "result": "Failed",
             "error": str(e),
             "timestamp": datetime.now().isoformat()
         })
@@ -1078,161 +1074,112 @@ def retrieve_knowledge_node(state: CircuitAnalysisState) -> CircuitAnalysisState
 
 
 def simulate_circuit_node(state: CircuitAnalysisState) -> CircuitAnalysisState:
-    """Simulate the circuit using PySpice"""
-    logger.info("Simulating circuit with PySpice")
+    """Simulate circuit"""
+    logger.info("Simulating circuit")
     
     netlist = state.get("refined_netlist") or state.get("netlist")
     
     if not netlist:
-        logger.warning("No netlist available for simulation")
         state["simulation_attempted"] = True
         state["simulation_valid"] = False
-        state["simulation_error"] = "No netlist provided"
+        state["simulation_error"] = "No netlist"
         state["iteration"] += 1
         return state
     
     try:
-        simulator = get_simulator()
-        result = simulator.simulate(netlist)
+        result = get_simulator().simulate(netlist)
         
         state["simulation_attempted"] = True
         state["simulation_results"] = result.dict()
         state["simulation_valid"] = result.success
         
         if result.success:
-            logger.info("Simulation successful")
-            result_summary = {
-                "has_operating_point": result.operating_point is not None,
-                "has_dc": result.dc_analysis is not None,
-                "has_ac": result.ac_analysis is not None,
-                "has_transient": result.transient_analysis is not None
-            }
-            
-            if result.operating_point:
-                result_summary["num_nodes"] = len(result.operating_point)
-            
             state["reasoning_steps"].append({
                 "step": len(state["reasoning_steps"]) + 1,
                 "action": "simulate_circuit",
-                "result": "Simulation completed successfully",
-                "details": result_summary,
+                "result": "Success",
                 "timestamp": datetime.now().isoformat()
             })
         else:
-            logger.warning(f"Simulation failed: {result.error_message}")
             state["simulation_error"] = result.error_message
             state["reasoning_steps"].append({
                 "step": len(state["reasoning_steps"]) + 1,
                 "action": "simulate_circuit",
-                "result": "Simulation failed",
+                "result": "Failed",
                 "error": result.error_message,
                 "timestamp": datetime.now().isoformat()
             })
-    
     except Exception as e:
-        logger.error(f"Simulation error: {e}")
         state["simulation_attempted"] = True
         state["simulation_valid"] = False
         state["simulation_error"] = str(e)
-        state["reasoning_steps"].append({
-            "step": len(state["reasoning_steps"]) + 1,
-            "action": "simulate_circuit",
-            "result": "Simulation exception",
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
-        })
     
     state["iteration"] += 1
     return state
 
 
 def generate_answer_node(state: CircuitAnalysisState, llm: Any) -> CircuitAnalysisState:
-    """Generate final answer using LLM with all gathered context"""
-    logger.info("Generating final answer")
+    """Generate answer"""
+    logger.info("Generating answer")
     
     if not llm:
-        logger.error("LLM not provided")
-        state["final_answer"] = "Error: Language model not available"
+        state["final_answer"] = "Error: LLM not available"
         state["answer_generated"] = True
         return state
     
-    # Construct comprehensive prompt
     prompt_parts = [
         f"Question: {state['question']}",
-        f"\nCircuit Description: {state.get('image_description', 'No description provided')}",
+        f"\nCircuit Description: {state.get('image_description', 'No description')}",
     ]
     
-    # Add netlist
     netlist = state.get("refined_netlist") or state.get("netlist")
     if netlist:
         prompt_parts.append(f"\nSPICE Netlist:\n{netlist}")
     
-    # Add simulation results
     if state.get("simulation_valid") and state.get("simulation_results"):
         sim_results = state["simulation_results"]
-        prompt_parts.append(f"\nSimulation Results (PySpice):")
+        prompt_parts.append("\nSimulation Results (PySpice):")
         
-        # Format simulation results nicely
         if sim_results.get("operating_point"):
-            prompt_parts.append("\nOperating Point Analysis:")
+            prompt_parts.append("\nOperating Point:")
             for node, voltage in sim_results["operating_point"].items():
                 prompt_parts.append(f"  Node {node}: {voltage:.6f} V")
         
-        if sim_results.get("dc_analysis") and isinstance(sim_results["dc_analysis"], dict):
-            if "sweep_variable" in sim_results["dc_analysis"]:
-                prompt_parts.append(f"\nDC Sweep Analysis (Variable: {sim_results['dc_analysis']['sweep_variable']}):")
-                prompt_parts.append("  [Data available for plotting]")
-            else:
-                prompt_parts.append("\nDC Analysis:")
-                for node, voltage in sim_results["dc_analysis"].items():
-                    if isinstance(voltage, (int, float)):
-                        prompt_parts.append(f"  Node {node}: {voltage:.6f} V")
-        
+        if sim_results.get("dc_analysis"):
+            prompt_parts.append("\nDC Analysis: Available")
         if sim_results.get("ac_analysis"):
-            prompt_parts.append(f"\nAC Analysis: Available")
-        
+            prompt_parts.append("\nAC Analysis: Available")
         if sim_results.get("transient_analysis"):
-            prompt_parts.append(f"\nTransient Analysis: Available")
-    
+            prompt_parts.append("\nTransient Analysis: Available")
     elif state.get("simulation_error"):
         prompt_parts.append(f"\nSimulation Error: {state['simulation_error']}")
-        prompt_parts.append("Note: Provide theoretical analysis since simulation failed.")
     
-    # Add retrieved context
     if state.get("retrieved_context"):
         prompt_parts.append(f"\n{state['retrieved_context']}")
     
     prompt_parts.append("\n" + "="*60)
-    prompt_parts.append("Based on all the information above, provide a comprehensive answer.")
-    prompt_parts.append("\nYour answer should include:")
-    prompt_parts.append("1. Direct answer to the question")
-    prompt_parts.append("2. Step-by-step explanation with clear reasoning")
-    prompt_parts.append("3. Relevant calculations showing your work")
-    prompt_parts.append("4. Circuit theory concepts and principles")
-    prompt_parts.append("5. Verification using simulation results (if available)")
-    prompt_parts.append("6. Educational insights for learning")
+    prompt_parts.append("Provide a comprehensive answer including:")
+    prompt_parts.append("1. Direct answer")
+    prompt_parts.append("2. Step-by-step explanation")
+    prompt_parts.append("3. Calculations")
+    prompt_parts.append("4. Circuit theory")
+    prompt_parts.append("5. Simulation verification (if available)")
     
     full_prompt = "\n".join(prompt_parts)
     
     try:
-        # Generate answer
         messages = [
-            SystemMessage(content="You are an expert circuit analysis tutor. Provide clear, educational explanations with detailed step-by-step reasoning. Always show your calculations and explain the underlying theory."),
+            SystemMessage(content="You are an expert circuit analysis tutor. Provide clear, educational explanations with detailed reasoning."),
             HumanMessage(content=full_prompt)
         ]
         
         response = llm.invoke(messages)
-        
-        if hasattr(response, 'content'):
-            answer = response.content
-        else:
-            answer = str(response)
+        answer = response.content if hasattr(response, 'content') else str(response)
         
         state["final_answer"] = answer
         state["answer_generated"] = True
         
-        # Calculate confidence based on available information
-        confidence = 0.5  # Base confidence
+        confidence = 0.5
         if state.get("simulation_valid"):
             confidence += 0.3
         if state.get("retrieved_context") and len(state.get("retrieved_context", "")) > 100:
@@ -1243,29 +1190,15 @@ def generate_answer_node(state: CircuitAnalysisState, llm: Any) -> CircuitAnalys
         state["reasoning_steps"].append({
             "step": len(state["reasoning_steps"]) + 1,
             "action": "generate_answer",
-            "result": "Answer generated successfully",
+            "result": "Success",
             "confidence": state["confidence_score"],
             "timestamp": datetime.now().isoformat()
         })
         
-        logger.info(f"Answer generated successfully (confidence: {state['confidence_score']:.2f})")
-        
+        logger.info(f"Answer generated (confidence: {state['confidence_score']:.2f})")
     except Exception as e:
         logger.error(f"Answer generation failed: {e}")
-        
-        # Create fallback answer with available information
-        fallback_parts = [f"I encountered an error generating the full answer: {str(e)}"]
-        fallback_parts.append("\nHowever, here's what I gathered from the analysis:")
-        
-        if state.get("simulation_results"):
-            fallback_parts.append(f"\nSimulation Results:")
-            fallback_parts.append(json.dumps(state["simulation_results"], indent=2))
-        
-        if state.get("retrieved_context"):
-            context_preview = state["retrieved_context"][:500]
-            fallback_parts.append(f"\nRelevant Context (preview):\n{context_preview}...")
-        
-        state["final_answer"] = "\n".join(fallback_parts)
+        state["final_answer"] = f"Error generating answer: {str(e)}"
         state["answer_generated"] = True
         state["confidence_score"] = 0.3
     
@@ -1273,7 +1206,7 @@ def generate_answer_node(state: CircuitAnalysisState, llm: Any) -> CircuitAnalys
 
 
 def route_decision(state: CircuitAnalysisState) -> Literal["retrieve", "simulate", "generate", "end"]:
-    """Route to next node based on decided action"""
+    """Route to next node"""
     action = state.get("next_action", "end")
     
     if action == "retrieve_knowledge":
@@ -1286,41 +1219,24 @@ def route_decision(state: CircuitAnalysisState) -> Literal["retrieve", "simulate
         return "end"
 
 
-# ==================== BUILD LANGGRAPH WORKFLOW ====================
+# ==================== BUILD WORKFLOW ====================
 
 def create_circuit_analysis_graph(llm: Any, rag_retriever: Optional[HybridRAGRetriever] = None) -> StateGraph:
-    """
-    Create the LangGraph workflow for circuit analysis
-    
-    Args:
-        llm: Language model instance
-        rag_retriever: HybridRAGRetriever instance (optional)
-            
-    Returns:
-        Compiled StateGraph
-    """
-    
-    # Set global RAG instance
+    """Create LangGraph workflow"""
     global _rag_instance
     _rag_instance = rag_retriever
     
-    # Create graph
     workflow = StateGraph(CircuitAnalysisState)
     
-    # Add nodes with proper lambda wrapping to pass llm
     workflow.add_node("initialize", initialize_state)
     workflow.add_node("decide", decide_next_action)
     workflow.add_node("retrieve", retrieve_knowledge_node)
     workflow.add_node("simulate", simulate_circuit_node)
     workflow.add_node("generate", lambda state: generate_answer_node(state, llm))
     
-    # Set entry point
     workflow.set_entry_point("initialize")
-    
-    # Add edges
     workflow.add_edge("initialize", "decide")
     
-    # Add conditional routing from decide node
     workflow.add_conditional_edges(
         "decide",
         route_decision,
@@ -1332,60 +1248,39 @@ def create_circuit_analysis_graph(llm: Any, rag_retriever: Optional[HybridRAGRet
         }
     )
     
-    # After each action, go back to decide (except generate which goes to END)
     workflow.add_edge("retrieve", "decide")
     workflow.add_edge("simulate", "decide")
     workflow.add_edge("generate", END)
     
-    # Compile with checkpointing for memory
     memory = MemorySaver()
     app = workflow.compile(checkpointer=memory)
     
-    logger.info("Circuit analysis graph compiled successfully")
+    logger.info("Circuit analysis graph compiled")
     return app
 
 
-# ==================== MAIN INTERFACE ====================
+# ==================== MAIN ENGINE ====================
 
 class CircuitAnalysisEngine:
-    """
-    Main interface for circuit analysis with LangGraph-based Decision-Making Head
-    Uses PySpice for accurate circuit simulation
-    """
+    """Main circuit analysis engine"""
     
     def __init__(self, config: Optional[Dict[str, Any]] = None):
-        """
-        Initialize the circuit analysis engine
-        
-        Args:
-            config: Configuration dictionary
-        """
-        # Load configuration
         self.config = config or self._default_config()
-        
-        # Validate configuration
         self._validate_config()
         
-        # Initialize LLM
         self.llm = self._initialize_llm()
         
-        # Initialize RAG retriever
         self.rag_retriever = None
         try:
             self.rag_retriever = HybridRAGRetriever(self.config.get("rag", {}))
         except Exception as e:
-            logger.warning(f"Failed to initialize RAG retriever: {e}")
+            logger.warning(f"Failed to initialize RAG: {e}")
         
-        # Create LangGraph workflow
-        self.graph = create_circuit_analysis_graph(
-            llm=self.llm,
-            rag_retriever=self.rag_retriever
-        )
-        
-        logger.info("Circuit Analysis Engine initialized successfully")
+        self.graph = create_circuit_analysis_graph(self.llm, self.rag_retriever)
+        logger.info("Circuit Analysis Engine initialized")
     
     def _default_config(self) -> Dict[str, Any]:
-        """Get default configuration"""
+        """Default configuration"""
         return {
             "llm": {
                 "provider": "openai",
@@ -1403,86 +1298,40 @@ class CircuitAnalysisEngine:
                 "chunk_overlap": 50,
                 "top_k": 5
             },
-            "simulation": {
-                "timeout": 30,
-                "max_retries": 2
-            },
-            "workflow": {
-                "max_iterations": 10
-            }
+            "workflow": {"max_iterations": 10}
         }
     
     def _validate_config(self):
         """Validate configuration"""
-        required_keys = ["llm", "rag"]
-        for key in required_keys:
-            if key not in self.config:
-                raise ValueError(f"Missing required config key: {key}")
-        
-        # Validate LLM config
-        if "provider" not in self.config["llm"]:
-            raise ValueError("LLM provider not specified in config")
+        if "llm" not in self.config or "provider" not in self.config["llm"]:
+            raise ValueError("Invalid LLM configuration")
     
     def _initialize_llm(self):
-        """Initialize language model based on configuration"""
+        """Initialize LLM"""
         llm_config = self.config["llm"]
         provider = llm_config["provider"].lower()
         model = llm_config.get("model")
         temperature = llm_config.get("temperature", 0.3)
         max_tokens = llm_config.get("max_tokens", 2000)
         
-        try:
-            if provider == "openai":
-                return ChatOpenAI(
-                    model=model or "gpt-4-turbo-preview",
-                    temperature=temperature,
-                    max_tokens=max_tokens
-                )
-            elif provider == "anthropic":
-                return ChatAnthropic(
-                    model=model or "claude-3-sonnet-20240229",
-                    temperature=temperature,
-                    max_tokens=max_tokens
-                )
-            elif provider == "ollama":
-                return ChatOllama(
-                    model=model or "llama2",
-                    temperature=temperature
-                )
-            else:
-                raise ValueError(f"Unsupported LLM provider: {provider}")
-        except Exception as e:
-            logger.error(f"Failed to initialize LLM: {e}")
-            raise
+        if provider == "openai":
+            return ChatOpenAI(model=model or "gpt-4-turbo-preview", temperature=temperature, max_tokens=max_tokens)
+        elif provider == "anthropic":
+            return ChatAnthropic(model=model or "claude-3-sonnet-20240229", temperature=temperature, max_tokens=max_tokens)
+        elif provider == "ollama":
+            return ChatOllama(model=model or "llama2", temperature=temperature)
+        else:
+            raise ValueError(f"Unsupported LLM provider: {provider}")
     
-    def analyze(
-        self,
-        question: str,
-        netlist: str,
-        image_description: str = "",
-        circuit_type: Optional[str] = None,
-        max_iterations: Optional[int] = None
-    ) -> Dict[str, Any]:
-        """
-        Analyze a circuit and answer questions
+    def analyze(self, question: str, netlist: str, image_description: str = "",
+                circuit_type: Optional[str] = None, max_iterations: Optional[int] = None) -> Dict[str, Any]:
+        """Analyze circuit"""
+        logger.info(f"Starting analysis: {question[:50]}...")
         
-        Args:
-            question: Question about the circuit
-            netlist: SPICE netlist of the circuit
-            image_description: Optional description of circuit diagram
-            circuit_type: Optional circuit type hint
-            max_iterations: Maximum workflow iterations
-            
-        Returns:
-            Dictionary with analysis results
-        """
-        logger.info(f"Starting circuit analysis for question: {question[:50]}...")
-        
-        # Prepare initial state
         initial_state = {
             "question": question,
             "netlist": netlist,
-            "image_description": image_description or "No description provided",
+            "image_description": image_description or "No description",
             "circuit_type": circuit_type,
             "refined_netlist": None,
             "messages": [],
@@ -1504,11 +1353,9 @@ class CircuitAnalysisEngine:
         }
         
         try:
-            # Run the graph
             config = {"configurable": {"thread_id": f"analysis_{datetime.now().timestamp()}"}}
             final_state = self.graph.invoke(initial_state, config)
             
-            # Extract results
             result = {
                 "question": question,
                 "answer": final_state.get("final_answer", "No answer generated"),
@@ -1521,52 +1368,52 @@ class CircuitAnalysisEngine:
                 "success": final_state.get("answer_generated", False)
             }
             
-            logger.info(f"Analysis completed in {result['iterations']} iterations")
+            logger.info(f"Analysis complete in {result['iterations']} iterations")
             return result
-            
         except Exception as e:
             logger.error(f"Analysis failed: {e}")
             return {
                 "question": question,
                 "answer": f"Analysis failed: {str(e)}",
                 "confidence_score": 0.0,
-                "simulation_results": None,
-                "simulation_valid": False,
-                "reasoning_steps": [],
-                "iterations": 0,
                 "success": False,
                 "error": str(e)
             }
     
-    async def analyze_async(
-        self,
-        question: str,
-        netlist: str,
-        image_description: str = "",
-        circuit_type: Optional[str] = None,
-        max_iterations: Optional[int] = None
-    ) -> Dict[str, Any]:
-        """
-        Async version of analyze method
-        
-        Args:
-            question: Question about the circuit
-            netlist: SPICE netlist of the circuit
-            image_description: Optional description of circuit diagram
-            circuit_type: Optional circuit type hint
-            max_iterations: Maximum workflow iterations
-            
-        Returns:
-            Dictionary with analysis results
-        """
-        # For now, wrap sync version - could be improved with true async graph
+    async def analyze_async(self, question: str, netlist: str, image_description: str = "",
+                           circuit_type: Optional[str] = None, max_iterations: Optional[int] = None) -> Dict[str, Any]:
+        """Async version"""
         return self.analyze(question, netlist, image_description, circuit_type, max_iterations)
     
+    def force_reindex_knowledge_base(self):
+        """Force complete reindex"""
+        if self.rag_retriever:
+            self.rag_retriever.force_reindex()
+        else:
+            logger.warning("RAG not available")
+    
+    def refresh_knowledge_base(self):
+        """Check and update knowledge base"""
+        if self.rag_retriever and self.rag_retriever.indexer:
+            if self.rag_retriever.indexer.needs_reindex():
+                logger.info("Changes detected, updating")
+                self.rag_retriever._incremental_update()
+            else:
+                logger.info("No changes detected")
+        else:
+            logger.warning("RAG not available")
+    
+    def get_knowledge_base_stats(self) -> Dict[str, Any]:
+        """Get KB statistics"""
+        if self.rag_retriever:
+            return self.rag_retriever.get_stats()
+        return {"error": "RAG not available"}
+    
     def get_system_status(self) -> Dict[str, Any]:
-        """Get status of all system components"""
+        """Get system status"""
         simulator = get_simulator()
         
-        return {
+        status = {
             "llm": {
                 "provider": self.config["llm"]["provider"],
                 "model": self.config["llm"]["model"],
@@ -1580,9 +1427,14 @@ class CircuitAnalysisEngine:
             },
             "simulator": {
                 "type": "PySpice",
-                "pyspice_available": simulator.pyspice_available if simulator else False
+                "available": simulator.pyspice_available if simulator else False
             },
-            "graph": {
-                "compiled": self.graph is not None
-            }
+            "graph": {"compiled": self.graph is not None}
         }
+        
+        if self.rag_retriever:
+            status["knowledge_base"] = self.get_knowledge_base_stats()
+        
+        return status
+
+
